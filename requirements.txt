@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+openai
+pydantic
+sqlalchemy
+psycopg2-binary
+pandas
+matplotlib
+python-dotenv
+requests
