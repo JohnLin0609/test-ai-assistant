@@ -8,3 +8,5 @@ pandas
 matplotlib
 python-dotenv
 requests
+
+# codex resume 019b9691-3f75-72e3-80fe-b82ca062701c
