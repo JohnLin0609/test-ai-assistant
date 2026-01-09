@@ -1,18 +1,34 @@
 from __future__ import annotations
 ################################################# Record what you update and the date in here. #################################################
-# Updates (2026-01-08):
+### Under each date, separate each update by a title of summary which will be used as git commit.
+### Like : --- Initial commit ---
+# Update Log
+# 2026-01-08
+# --- Schema guidance and validation ---
 # - Added schema.sql hints + form_name filtering/joining for spc_measurements analysis.
-# - Added trace logging in responses for full tool/assistant workflow visibility.
-# - Expanded plotting (multi-plot, scatter/hist) with richer auto-plot summaries.
 # - Tightened SQL/schema validation and made MAX_SQL_ROWS default no-limit (0).
-# - Simplified system instructions, improved category targeting, and ignored model limits unless requested.
 # - Hardened schema parsing/trace for varied column formats.
-# Updates (2026-01-09):
+# --- Plotting and summaries ---
+# - Expanded plotting (multi-plot, scatter/hist) with richer auto-plot summaries.
+# --- Trace visibility ---
+# - Added trace logging in responses for full tool/assistant workflow visibility.
+# --- Instruction tuning ---
+# - Simplified system instructions, improved category targeting, and ignored model limits unless requested.
+# 2026-01-09
+# --- Category and schema routing ---
 # - Treat category/form lookup questions as tool-required to avoid empty responses.
 # - Default category lookups to product_categories and skip extra schema fetches unless joins are needed.
 # - Apply category_name filters to base category tables when no join is required.
+# - Fix datetime column detection and widen analysis intent for "production values".
+# - Count-style questions return a single COUNT(*) without day grouping.
+# --- Response tone and safety ---
 # - Return human-friendly replies for single-row lookups and avoid datetime ranges on numeric IDs.
 # - Add common-chat handling with safe fallbacks and direct date/time replies.
+# - Avoid answering non-time questions with date replies; add safe weather fallback.
+# --- Workflow visibility ---
+# - Add workflow + query logging in responses and return friendlier error messages.
+# --- Analysis summaries ---
+# - Provide opinion-focused analysis summaries with sample rows and references.
 
 import ast
 import base64
@@ -145,6 +161,8 @@ class ChatResponse(BaseModel):
     query_saved_to: Optional[str] = None
     trace: Optional[List[Dict[str, Any]]] = None
     plots: Optional[List[Dict[str, Any]]] = None
+    workflow: Optional[List[str]] = None
+    queries: Optional[List[Dict[str, Any]]] = None
 
 
 # validate parameters
@@ -1123,7 +1141,15 @@ def _needs_opinion(message: str) -> bool:
 
 def _is_analysis_request(message: str) -> bool:
     return bool(re.search(
-        r"\b(analy[sz]e|analysis|trend|insight|opinion|interpret|explain|pattern|correlation|variance|distribution)\b",
+        r"\b(analy[sz]e|analysis|trend|insight|opinion|interpret|explain|pattern|correlation|variance|distribution|production|values?|measurements?)\b",
+        message,
+        re.IGNORECASE,
+    ))
+
+
+def _is_count_request(message: str) -> bool:
+    return bool(re.search(
+        r"\b(how many|count|number of|total)\b",
         message,
         re.IGNORECASE,
     ))
@@ -1293,6 +1319,7 @@ def _pick_datetime_column(schema: Dict[str, Any]) -> Optional[str]:
         if not name:
             continue
         lower = name.lower()
+        tokens = [t for t in re.split(r"[^a-z0-9]+", lower) if t]
         score = 0
         if "inspect_time" in lower:
             score += 100
@@ -1300,20 +1327,24 @@ def _pick_datetime_column(schema: Dict[str, Any]) -> Optional[str]:
             score += 90
         if "timestamp" in lower:
             score += 80
+        if any(tok in ("timestamp", "datetime") for tok in tokens):
+            score += 80
         if lower.endswith("_time") or lower.endswith("_date"):
             score += 70
-        if "time" in lower:
+        if "created" in tokens or "updated" in tokens:
             score += 60
-        if "date" in lower:
+        if any(tok in ("date", "time") for tok in tokens):
             score += 50
         col_type = str(col.get("type", "")).lower()
         if "timestamp" in col_type:
-            score += 20
+            score += 40
         if "date" in col_type:
-            score += 10
+            score += 30
         if score > best_score:
             best_score = score
             best = name
+    if best_score <= 0:
+        return None
     return best
 
 
@@ -1496,6 +1527,7 @@ def _auto_query_from_message(message: str) -> Tuple[Optional[str], Optional[Dict
     if dates and not dt_col:
         return None, None, f"No datetime column found in {base_table} for date filter."
 
+    count_request = _is_count_request(message)
     prefer_raw = analysis_request and base_table.lower() == "spc_measurements"
     metric_col = _pick_metric_column(base_schema) if prefer_raw else None
 
@@ -1547,7 +1579,9 @@ def _auto_query_from_message(message: str) -> Tuple[Optional[str], Optional[Dict
         if category_col and target_table:
             select_cols.append(f"{target_table}.{category_col}")
     else:
-        if dt_col:
+        if count_request:
+            select_cols.append("COUNT(*) AS count")
+        elif dt_col:
             select_cols.append(f"date_trunc('day', {base_table}.{dt_col}) AS day")
             select_cols.append("COUNT(*) AS count")
         else:
@@ -1567,7 +1601,7 @@ def _auto_query_from_message(message: str) -> Tuple[Optional[str], Optional[Dict
     if dt_col:
         if prefer_raw:
             sql_parts.append(f"ORDER BY {base_table}.{dt_col}")
-        else:
+        elif not count_request:
             sql_parts.append("GROUP BY day")
             sql_parts.append("ORDER BY day")
 
@@ -1647,7 +1681,9 @@ def _direct_time_response(message: str) -> Optional[str]:
     if not message:
         return None
     lower = message.lower()
-    if not re.search(r"\b(today|date|day|time|weekday|day of week|now)\b", lower):
+    if re.search(r"\b(weather|temperature|forecast|rain|snow|wind|humidity|storm)\b", lower):
+        return None
+    if not re.search(r"\b(time|date|day|weekday|day of week)\b", lower):
         return None
     now = datetime.now().astimezone()
     day_str = now.strftime("%A")
@@ -1656,8 +1692,10 @@ def _direct_time_response(message: str) -> Optional[str]:
     tz = now.strftime("%Z")
     tz_note = f" ({tz})" if tz else " (local time)"
 
-    wants_time = bool(re.search(r"\btime|now|clock\b", lower))
-    wants_date = bool(re.search(r"\b(today|date|day|weekday|day of week)\b", lower))
+    wants_time = bool(re.search(r"\btime|clock\b", lower))
+    wants_date = bool(re.search(r"\b(date|day|weekday|day of week)\b", lower))
+    if not wants_time and not wants_date:
+        return None
     if wants_time and wants_date:
         return f"Today is {day_str}, {date_str}. The current time is {time_str}{tz_note}."
     if wants_time:
@@ -1665,6 +1703,15 @@ def _direct_time_response(message: str) -> Optional[str]:
     if wants_date:
         return f"Today is {day_str}, {date_str}{tz_note}."
     return None
+
+
+def _direct_weather_response(message: str) -> Optional[str]:
+    if not message:
+        return None
+    lower = message.lower()
+    if not re.search(r"\b(weather|temperature|forecast|rain|snow|wind|humidity|storm)\b", lower):
+        return None
+    return "I don't have live weather access here. " + _capabilities_message()
 
 
 def _format_simple_result(rows: List[Dict[str, Any]]) -> Optional[str]:
@@ -1680,6 +1727,74 @@ def _format_simple_result(rows: List[Dict[str, Any]]) -> Optional[str]:
         parts = [f"{key} = {_format_number(value)}" for key, value in row.items()]
         return "Here are the results: " + ", ".join(parts) + "."
     return None
+
+
+def _format_sample_rows(rows: List[Dict[str, Any]], limit: int = 5) -> Optional[List[str]]:
+    if not rows:
+        return None
+    sample = rows[:limit]
+    lines: List[str] = []
+    for row in sample:
+        if isinstance(row, dict):
+            parts = [f"{key}={_format_number(value)}" for key, value in row.items()]
+            lines.append("- " + ", ".join(parts))
+        else:
+            lines.append("- " + _safe_str(row, max_len=80))
+    return lines or None
+
+
+def _analysis_summary(result: Dict[str, Any], message: Optional[str]) -> str:
+    rows = result.get("rows", []) or []
+    saved_to = result.get("saved_to")
+    opinion = None
+    plot_info = _infer_plot_config(rows)
+    if plot_info:
+        for line in _plot_insight_lines(plot_info):
+            if line.startswith("Opinion:"):
+                opinion = line[len("Opinion:"):].strip()
+                break
+    if not opinion:
+        opinion = "The data is too limited to draw a strong conclusion."
+
+    lines = [f"Opinion: {opinion}"]
+    sample_lines = _format_sample_rows(rows, limit=5)
+    if sample_lines:
+        lines.append("Sample rows:")
+        lines.extend(sample_lines)
+    if saved_to:
+        lines.append(f"Raw rows saved to: {saved_to}")
+    return "\n".join(lines)
+
+
+def _workflow_add(workflow: List[str], text: str) -> None:
+    workflow.append(text)
+
+
+def _log_query(
+    query_log: List[Dict[str, Any]],
+    sql: str,
+    params: Optional[Any],
+    source: str,
+    result: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+) -> None:
+    entry: Dict[str, Any] = {
+        "sql": sql,
+        "params": params,
+        "source": source,
+    }
+    if result:
+        entry["row_count"] = result.get("row_count")
+        entry["truncated"] = result.get("truncated")
+        entry["saved_to"] = result.get("saved_to")
+    if error:
+        entry["error"] = error
+    query_log.append(entry)
+
+
+def _friendly_tool_error(message: Optional[str], error: str) -> str:
+    base = "I couldn't complete that request with the available data."
+    return f"{base} {_capabilities_message()}"
 
 
 def _datetime_range_line(df: pd.DataFrame) -> Optional[str]:
@@ -2130,13 +2245,15 @@ def _summarize_rows(result: Dict[str, Any], message: Optional[str] = None) -> st
     simple_text = _format_simple_result(rows)
     if simple_text:
         return simple_text
+    if message and _is_analysis_request(message):
+        return _analysis_summary(result, message)
 
     df = pd.DataFrame(rows)
     lines: List[str] = []
     suffix = " (truncated)" if truncated else ""
-    lines.append(f"Summary based on {len(rows)} row(s){suffix}.")
+    lines.append(f"I found {len(rows)} row(s){suffix}.")
     if saved_to:
-        lines.append(f"Saved raw rows to: {saved_to}")
+        lines.append(f"Raw rows saved to: {saved_to}")
 
     columns = [str(c) for c in df.columns.tolist()]
     if columns:
@@ -2339,6 +2456,9 @@ def chat(req: ChatRequest) -> ChatResponse:
         "message": req.message,
         "history_len": len(req.history or []),
     })
+    workflow: List[str] = []
+    _workflow_add(workflow, "Received request.")
+    query_log: List[Dict[str, Any]] = []
     if not needs_tools:
         quick = _direct_time_response(req.message)
         if quick:
@@ -2346,7 +2466,16 @@ def chat(req: ChatRequest) -> ChatResponse:
                 "content": quick,
                 "tool_calls": [],
             })
-            return ChatResponse(text=quick, trace=trace, plots=[])
+            _workflow_add(workflow, "Answered directly without database.")
+            return ChatResponse(text=quick, trace=trace, plots=[], workflow=workflow, queries=query_log)
+        weather = _direct_weather_response(req.message)
+        if weather:
+            _trace_event(trace, "assistant", {
+                "content": weather,
+                "tool_calls": [],
+            })
+            _workflow_add(workflow, "Returned safe fallback without database.")
+            return ChatResponse(text=weather, trace=trace, plots=[], workflow=workflow, queries=query_log)
         resp = ollama_chat(messages=messages, tools=None)
         assistant_msg = resp.get("message", {}) or {}
         content = assistant_msg.get("content") or ""
@@ -2356,7 +2485,8 @@ def chat(req: ChatRequest) -> ChatResponse:
             "content": content,
             "tool_calls": [],
         })
-        return ChatResponse(text=content, trace=trace, plots=[])
+        _workflow_add(workflow, "Answered directly without database.")
+        return ChatResponse(text=content, trace=trace, plots=[], workflow=workflow, queries=query_log)
 
     plot_items: List[Dict[str, Any]] = []
     plot_b64: Optional[str] = None
@@ -2404,6 +2534,8 @@ def chat(req: ChatRequest) -> ChatResponse:
             query_saved_to=query_saved_to,
             trace=trace,
             plots=plot_items,
+            workflow=workflow,
+            queries=query_log,
         )
 
     # Agent loop: model -> tool_calls -> execute -> tool messages -> model ... :contentReference[oaicite:7]{index=7}
@@ -2481,13 +2613,14 @@ def chat(req: ChatRequest) -> ChatResponse:
                             "source": "server",
                         })
                         return _respond(
-                            text=f"Tool error: {exc}",
+                            text=_friendly_tool_error(req.message, str(exc)),
                             plot_png_base64=plot_b64,
                             plot_saved_to=plot_saved_to,
                             query_saved_to=query_saved_to,
                         )
                     _record_schema(schema_cache, result)
                     schema_checked = bool(schema_cache)
+                    _workflow_add(workflow, "Schema checked: product_categories.")
                     _trace_event(trace, "tool_result", {
                         "name": "describe_table",
                         "source": "server",
@@ -2514,13 +2647,14 @@ def chat(req: ChatRequest) -> ChatResponse:
                             "source": "server",
                         })
                         return _respond(
-                            text=f"Tool error: {exc}",
+                            text=_friendly_tool_error(req.message, str(exc)),
                             plot_png_base64=plot_b64,
                             plot_saved_to=plot_saved_to,
                             query_saved_to=query_saved_to,
                         )
                     _record_schema(schema_cache, result)
                     schema_checked = bool(schema_cache)
+                    _workflow_add(workflow, "Schema checked: sub_categories.")
                     _trace_event(trace, "tool_result", {
                         "name": "describe_table",
                         "source": "server",
@@ -2547,13 +2681,14 @@ def chat(req: ChatRequest) -> ChatResponse:
                             "source": "server",
                         })
                         return _respond(
-                            text=f"Tool error: {exc}",
+                            text=_friendly_tool_error(req.message, str(exc)),
                             plot_png_base64=plot_b64,
                             plot_saved_to=plot_saved_to,
                             query_saved_to=query_saved_to,
                         )
                     _record_schema(schema_cache, result)
                     schema_checked = bool(schema_cache)
+                    _workflow_add(workflow, "Schema checked: forms.")
                     _trace_event(trace, "tool_result", {
                         "name": "describe_table",
                         "source": "server",
@@ -2583,13 +2718,14 @@ def chat(req: ChatRequest) -> ChatResponse:
                             "source": "server",
                         })
                         return _respond(
-                            text=f"Tool error: {exc}",
+                            text=_friendly_tool_error(req.message, str(exc)),
                             plot_png_base64=plot_b64,
                             plot_saved_to=plot_saved_to,
                             query_saved_to=query_saved_to,
                         )
                     _record_schema(schema_cache, result)
                     schema_checked = bool(schema_cache)
+                    _workflow_add(workflow, "Schema checked: spc_measurements.")
                     _trace_event(trace, "tool_result", {
                         "name": "describe_table",
                         "source": "server",
@@ -2616,13 +2752,14 @@ def chat(req: ChatRequest) -> ChatResponse:
                             "source": "server",
                         })
                         return _respond(
-                            text=f"Tool error: {exc}",
+                            text=_friendly_tool_error(req.message, str(exc)),
                             plot_png_base64=plot_b64,
                             plot_saved_to=plot_saved_to,
                             query_saved_to=query_saved_to,
                         )
                     _record_schema(schema_cache, result)
                     schema_checked = bool(schema_cache)
+                    _workflow_add(workflow, "Schema checked: forms.")
                     _trace_event(trace, "tool_result", {
                         "name": "describe_table",
                         "source": "server",
@@ -2696,8 +2833,10 @@ def chat(req: ChatRequest) -> ChatResponse:
                         "error": str(exc),
                         "source": "assistant_sql",
                     })
+                    _log_query(query_log, sql_text, sql_params, "assistant_sql", error=str(exc))
+                    _workflow_add(workflow, "SQL execution failed.")
                     return _respond(
-                        text=f"Tool error: {exc}",
+                        text=_friendly_tool_error(req.message, str(exc)),
                         plot_png_base64=plot_b64,
                         plot_saved_to=plot_saved_to,
                         query_saved_to=query_saved_to,
@@ -2705,6 +2844,9 @@ def chat(req: ChatRequest) -> ChatResponse:
                 last_tool_result = result
                 last_tool_name = "run_sql"
                 query_saved_to = result.get("saved_to")
+                _log_query(query_log, sql_text, sql_params, "assistant_sql", result=result)
+                _workflow_add(workflow, "SQL executed.")
+                _workflow_add(workflow, f"Rows returned: {result.get('row_count')}.")
                 if result.get("row_count", 0) == 0:
                     plot_b64 = None
                     plot_saved_to = None
@@ -2722,6 +2864,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                 text = _summarize_rows(result, message=req.message)
                 if plot_note:
                     text = f"{text}\n{plot_note}"
+                _workflow_add(workflow, "Answer generated from query results.")
                 return _respond(
                     text=text,
                     plot_png_base64=plot_b64,
@@ -2763,8 +2906,10 @@ def chat(req: ChatRequest) -> ChatResponse:
                         "error": str(exc),
                         "source": "assistant_sql",
                     })
+                    _log_query(query_log, sql_text, None, "assistant_sql", error=str(exc))
+                    _workflow_add(workflow, "SQL execution failed.")
                     return _respond(
-                        text=f"Tool error: {exc}",
+                        text=_friendly_tool_error(req.message, str(exc)),
                         plot_png_base64=plot_b64,
                         plot_saved_to=plot_saved_to,
                         query_saved_to=query_saved_to,
@@ -2772,6 +2917,9 @@ def chat(req: ChatRequest) -> ChatResponse:
                 last_tool_result = result
                 last_tool_name = "run_sql"
                 query_saved_to = result.get("saved_to")
+                _log_query(query_log, sql_text, None, "assistant_sql", result=result)
+                _workflow_add(workflow, "SQL executed.")
+                _workflow_add(workflow, f"Rows returned: {result.get('row_count')}.")
                 if result.get("row_count", 0) == 0:
                     plot_b64 = None
                     plot_saved_to = None
@@ -2789,6 +2937,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                 text = _summarize_rows(result, message=req.message)
                 if plot_note:
                     text = f"{text}\n{plot_note}"
+                _workflow_add(workflow, "Answer generated from query results.")
                 return _respond(
                     text=text,
                     plot_png_base64=plot_b64,
@@ -2811,8 +2960,10 @@ def chat(req: ChatRequest) -> ChatResponse:
                             "error": str(exc),
                             "source": "auto_query",
                         })
+                        _log_query(query_log, sql, params, "auto_query", error=str(exc))
+                        _workflow_add(workflow, "SQL execution failed.")
                         return _respond(
-                            text=f"Tool error: {exc}",
+                            text=_friendly_tool_error(req.message, str(exc)),
                             plot_png_base64=plot_b64,
                             plot_saved_to=plot_saved_to,
                             query_saved_to=query_saved_to,
@@ -2820,6 +2971,9 @@ def chat(req: ChatRequest) -> ChatResponse:
                     last_tool_result = result
                     last_tool_name = "run_sql"
                     query_saved_to = result.get("saved_to")
+                    _log_query(query_log, sql, params, "auto_query", result=result)
+                    _workflow_add(workflow, "SQL executed.")
+                    _workflow_add(workflow, f"Rows returned: {result.get('row_count')}.")
                     if result.get("row_count", 0) == 0:
                         plot_b64 = None
                         plot_saved_to = None
@@ -2837,6 +2991,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                     text = _summarize_rows(result, message=req.message)
                     if plot_note:
                         text = f"{text}\n{plot_note}"
+                    _workflow_add(workflow, "Answer generated from query results.")
                     return _respond(
                         text=text,
                         plot_png_base64=plot_b64,
@@ -2845,7 +3000,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                     )
                 if error:
                     return _respond(
-                        text=f"Tool error: {error}",
+                        text=_friendly_tool_error(req.message, error),
                         plot_png_base64=plot_b64,
                         plot_saved_to=plot_saved_to,
                         query_saved_to=query_saved_to,
@@ -2857,6 +3012,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                 text = _summarize_rows(last_tool_result, message=req.message)
                 if plot_note:
                     text = f"{text}\n{plot_note}"
+                _workflow_add(workflow, "Answer generated from query results.")
                 return _respond(
                     text=text,
                     plot_png_base64=plot_b64,
@@ -2868,6 +3024,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                 and last_tool_name == "run_sql"
                 and _looks_unhelpful_response(final_text, last_tool_result)
             ):
+                _workflow_add(workflow, "Answer generated from query results.")
                 return _respond(
                     text=_summarize_rows(last_tool_result, message=req.message),
                     plot_png_base64=plot_b64,
@@ -2912,6 +3069,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                             "error": "schema required before run_sql",
                             "source": "model",
                         })
+                        _workflow_add(workflow, "Blocked SQL execution (schema not checked).")
                         if not schema_prompted:
                             messages.append({
                                 "role": "system",
@@ -2955,6 +3113,9 @@ def chat(req: ChatRequest) -> ChatResponse:
                     last_tool_signature = _tool_signature(tool_calls)
                     last_tool_error = None
                     query_saved_to = result.get("saved_to")
+                    _log_query(query_log, args["sql"], args.get("params"), "model", result=result)
+                    _workflow_add(workflow, "SQL executed.")
+                    _workflow_add(workflow, f"Rows returned: {result.get('row_count')}.")
                     _trace_event(trace, "tool_result", {
                         "name": "run_sql",
                         "row_count": result.get("row_count"),
@@ -3029,6 +3190,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                     last_tool_signature = _tool_signature(tool_calls)
                     last_tool_error = None
                     last_tool_name = "make_plot"
+                    _workflow_add(workflow, "Plot generated.")
                     _trace_event(trace, "tool_result", {
                         "name": "make_plot",
                         "saved_to": result.get("saved_to"),
@@ -3048,6 +3210,8 @@ def chat(req: ChatRequest) -> ChatResponse:
                     _record_schema(schema_cache, result)
                     schema_checked = bool(schema_cache)
                     last_tool_error = None
+                    if result.get("table"):
+                        _workflow_add(workflow, f"Schema checked: {result.get('table')}.")
                     _trace_event(trace, "tool_result", {
                         "name": "get_schema",
                         "source": "model",
@@ -3086,6 +3250,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                     _record_schema(schema_cache, result)
                     schema_checked = bool(schema_cache)
                     last_tool_error = None
+                    _workflow_add(workflow, f"Schema checked: {args['table']}.")
                     _trace_event(trace, "tool_result", {
                         "name": "describe_table",
                         "source": "model",
@@ -3111,6 +3276,9 @@ def chat(req: ChatRequest) -> ChatResponse:
                     "error": err,
                     "source": "model",
                 })
+                if name == "run_sql":
+                    _log_query(query_log, args.get("sql", ""), args.get("params"), "model", error=err)
+                    _workflow_add(workflow, "SQL execution failed.")
                 messages.append({
                     "role": "tool",
                     "name": name or "unknown",
@@ -3141,6 +3309,7 @@ def chat(req: ChatRequest) -> ChatResponse:
         )
         if plot_note:
             text = f"{text}\n{plot_note}"
+        _workflow_add(workflow, "Answer generated from tool results.")
         return _respond(
             text=text,
             plot_png_base64=plot_b64,
@@ -3149,7 +3318,7 @@ def chat(req: ChatRequest) -> ChatResponse:
         )
     if last_tool_error:
         return _respond(
-            text=f"Tool error: {last_tool_error}",
+            text=_friendly_tool_error(req.message, last_tool_error),
             plot_png_base64=plot_b64,
             plot_saved_to=plot_saved_to,
             query_saved_to=query_saved_to,
