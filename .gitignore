@@ -1,4 +1,4 @@
 .venv/
 query_results
 plot_results
-__pycache__
+__pycache__/
