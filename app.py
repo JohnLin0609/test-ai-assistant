@@ -1,5 +1,20 @@
 from __future__ import annotations
+################################################# Record what you update and the date in here. #################################################
+# Updates (2026-01-08):
+# - Added schema.sql hints + form_name filtering/joining for spc_measurements analysis.
+# - Added trace logging in responses for full tool/assistant workflow visibility.
+# - Expanded plotting (multi-plot, scatter/hist) with richer auto-plot summaries.
+# - Tightened SQL/schema validation and made MAX_SQL_ROWS default no-limit (0).
+# - Simplified system instructions, improved category targeting, and ignored model limits unless requested.
+# - Hardened schema parsing/trace for varied column formats.
+# Updates (2026-01-09):
+# - Treat category/form lookup questions as tool-required to avoid empty responses.
+# - Default category lookups to product_categories and skip extra schema fetches unless joins are needed.
+# - Apply category_name filters to base category tables when no join is required.
+# - Return human-friendly replies for single-row lookups and avoid datetime ranges on numeric IDs.
+# - Add common-chat handling with safe fallbacks and direct date/time replies.
 
+import ast
 import base64
 import io
 import os
@@ -202,7 +217,14 @@ def _record_schema(
     columns = schema.get("columns") or []
     if not table or not isinstance(columns, list):
         return False
-    names = [col.get("name") for col in columns if isinstance(col, dict) and col.get("name")]
+    names: List[str] = []
+    for col in columns:
+        if isinstance(col, dict) and col.get("name"):
+            names.append(col.get("name"))
+        elif isinstance(col, str):
+            col_name = col.strip()
+            if col_name:
+                names.append(col_name)
     if not names:
         return False
     cache[table] = {
@@ -848,6 +870,138 @@ def _tool_calls_from_obj(obj: Any) -> List[Dict[str, Any]]:
     return calls
 
 
+def _ast_literal(node: ast.AST) -> Any:
+    try:
+        return ast.literal_eval(node)
+    except Exception:
+        return None
+
+
+def _python_call_to_args(name: str, call: ast.Call) -> Optional[Dict[str, Any]]:
+    positional = [_ast_literal(arg) for arg in call.args]
+    keywords = {
+        kw.arg: _ast_literal(kw.value)
+        for kw in call.keywords
+        if kw.arg
+    }
+
+    def pick_arg(idx: int, key: str) -> Any:
+        if key in keywords and keywords[key] is not None:
+            return keywords[key]
+        if len(positional) > idx:
+            return positional[idx]
+        return None
+
+    if name == "run_sql":
+        sql_value = pick_arg(0, "sql")
+        if not isinstance(sql_value, str):
+            return None
+        args: Dict[str, Any] = {"sql": sql_value}
+        params_value = pick_arg(1, "params")
+        if params_value is not None:
+            args["params"] = params_value
+        max_rows = pick_arg(2, "max_rows")
+        if max_rows is not None:
+            args["max_rows"] = max_rows
+        return args
+
+    if name == "get_schema":
+        args: Dict[str, Any] = {}
+        table_value = pick_arg(0, "table")
+        if isinstance(table_value, str) and table_value:
+            args["table"] = table_value
+        max_tables = pick_arg(1, "max_tables")
+        if max_tables is not None:
+            args["max_tables"] = max_tables
+        return args
+
+    if name == "describe_table":
+        table_value = pick_arg(0, "table")
+        if not isinstance(table_value, str) or not table_value:
+            return None
+        return {"table": table_value}
+
+    if name == "find_join_path":
+        from_table = pick_arg(0, "from_table")
+        to_table = pick_arg(1, "to_table")
+        if not isinstance(from_table, str) or not isinstance(to_table, str):
+            return None
+        args = {"from_table": from_table, "to_table": to_table}
+        max_hops = pick_arg(2, "max_hops")
+        if max_hops is not None:
+            args["max_hops"] = max_hops
+        return args
+
+    if name == "make_plot":
+        keys = ["title", "kind", "x_key", "y_key", "data", "legend_label"]
+        args: Dict[str, Any] = {}
+        for idx, key in enumerate(keys):
+            value = pick_arg(idx, key)
+            if value is None:
+                continue
+            args[key] = value
+        if not all(k in args for k in ("title", "kind", "x_key", "y_key", "data")):
+            return None
+        return args
+
+    return None
+
+
+def _python_tool_calls_from_text(text: str) -> List[Dict[str, Any]]:
+    if not text:
+        return []
+    if "<|python_tag|>" in text:
+        content = text.replace("<|python_tag|>", "").strip()
+    else:
+        if not any(f"{name}(" in text for name in TOOL_NAME_SET):
+            return []
+        content = text
+
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return []
+
+    calls: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def handle_call(node: ast.Call) -> None:
+        if isinstance(node.func, ast.Name):
+            name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            name = node.func.attr
+        else:
+            return
+        if name not in TOOL_NAME_SET:
+            return
+        args = _python_call_to_args(name, node)
+        if args is None:
+            return
+        try:
+            signature = f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
+        except TypeError:
+            signature = f"{name}:{args}"
+        if signature in seen:
+            return
+        seen.add(signature)
+        calls.append({"function": {"name": name, "arguments": args}})
+
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Expr):
+            value = stmt.value
+        elif isinstance(stmt, ast.Assign):
+            value = stmt.value
+        else:
+            continue
+        if isinstance(value, ast.Call):
+            handle_call(value)
+        for node in ast.walk(value):
+            if isinstance(node, ast.Call):
+                handle_call(node)
+
+    return calls
+
+
 def get_tool_calls(assistant_msg: Dict[str, Any]) -> List[Dict[str, Any]]:
     # Ollama returns tool calls under message.tool_calls.
     normalized = _normalize_tool_calls(assistant_msg.get("tool_calls"))
@@ -862,15 +1016,22 @@ def get_tool_calls(assistant_msg: Dict[str, Any]) -> List[Dict[str, Any]]:
             args = _coerce_args(function_call.get("arguments") or {})
             return [{"function": {"name": name, "arguments": args}}]
 
-    # Fallback: parse inline JSON tool calls from content.
+    # Fallback: parse inline JSON or python-tag tool calls from content.
     content = assistant_msg.get("content") or ""
-    if not content or not any(name in content for name in TOOL_NAME_SET):
+    if not content:
         return []
 
     calls: List[Dict[str, Any]] = []
     for obj in _extract_json_objects(content):
         calls.extend(_tool_calls_from_obj(obj))
-    return calls
+    if calls:
+        return calls
+
+    python_calls = _python_tool_calls_from_text(content)
+    if python_calls:
+        return python_calls
+
+    return []
 
 
 def _tool_signature(tool_calls: List[Dict[str, Any]]) -> str:
@@ -927,11 +1088,14 @@ def _trace_tool_args(name: Optional[str], args: Any) -> Dict[str, Any]:
 
 def _trace_schema_result(result: Dict[str, Any]) -> Dict[str, Any]:
     if "table" in result:
-        columns = [
-            col.get("name")
-            for col in result.get("columns", [])
-            if isinstance(col, dict) and col.get("name")
-        ]
+        columns: List[str] = []
+        for col in result.get("columns", []) or []:
+            if isinstance(col, dict) and col.get("name"):
+                columns.append(col.get("name"))
+            elif isinstance(col, str):
+                col_name = col.strip()
+                if col_name:
+                    columns.append(col_name)
         return {
             "table": result.get("table"),
             "column_count": len(columns),
@@ -969,7 +1133,17 @@ def _requires_tool_call(message: str) -> bool:
     if re.search(r"\d{4}-\d{2}-\d{2}", message):
         return True
     return bool(re.search(
-        r"\b(table|rows?|columns?|schema|database|sql|analy|analysis|plot|graph|chart|trend|average|mean|median|count|sum|min|max)\b",
+        r"\b(table|rows?|columns?|schema|database|sql|analy|analysis|plot|graph|chart|trend|average|mean|median|count|sum|min|max|category|category_name|category_id|sub_category|form|form_name|form_id)\b",
+        message,
+        re.IGNORECASE,
+    ))
+
+
+def _user_requested_limit(message: str) -> bool:
+    if not message:
+        return False
+    return bool(re.search(
+        r"\blimit\b|\bsample\b|\bpreview\b|\btop\s+\d+\b|\bfirst\s+\d+\b|\bhead\s+\d+\b|\brows?\s+\d+\b",
         message,
         re.IGNORECASE,
     ))
@@ -1067,6 +1241,13 @@ def _schema_hints_from_file(message: str) -> str:
         or _is_analysis_request(message)
     ) and "spc_measurements" in SCHEMA_FILE_TABLES:
         tables.append("spc_measurements")
+    if re.search(r"\bcategory(_name)?\b", message, re.IGNORECASE):
+        if "product_categories" in SCHEMA_FILE_TABLES:
+            tables.append("product_categories")
+        if "sub_categories" in SCHEMA_FILE_TABLES:
+            tables.append("sub_categories")
+        if "forms" in SCHEMA_FILE_TABLES:
+            tables.append("forms")
     if (
         _extract_form_names(message)
         or re.search(r"\bform_name\b|\bform name\b", message, re.IGNORECASE)
@@ -1079,6 +1260,7 @@ def _schema_hints_from_file(message: str) -> str:
             tables.append(table)
     if not tables:
         return ""
+    tables = list(dict.fromkeys(tables))
     lines: List[str] = []
     for table in tables[:4]:
         cols = SCHEMA_FILE_TABLES.get(table, [])
@@ -1088,6 +1270,15 @@ def _schema_hints_from_file(message: str) -> str:
         lines.append(f"{table}: {cols_line}")
     if "spc_measurements" in tables and "forms" in tables:
         lines.append("Join: spc_measurements.form_id = forms.form_id")
+    if (
+        "forms" in tables
+        and "sub_categories" in tables
+        and "product_categories" in tables
+    ):
+        lines.append(
+            "Join: forms.sub_category_id = sub_categories.sub_category_id "
+            "AND sub_categories.category_id = product_categories.category_id"
+        )
     if not lines:
         return ""
     return "Schema hints (from schema.sql):\n" + "\n".join(lines)
@@ -1176,8 +1367,12 @@ def _pick_metric_column(schema: Dict[str, Any]) -> Optional[str]:
 
 def _extract_category_value(message: str) -> Optional[str]:
     patterns = [
+        r"category_name\s*=\s*['\"]([^'\"]+)['\"]",
+        r"category name\s*=\s*['\"]([^'\"]+)['\"]",
         r"product_categories\s*=\s*['\"]([^'\"]+)['\"]",
         r"category\s*=\s*['\"]([^'\"]+)['\"]",
+        r"category_name\s+['\"]([^'\"]+)['\"]",
+        r"category name\s+['\"]([^'\"]+)['\"]",
         r"category\s+['\"]([^'\"]+)['\"]",
         r"category\s+([A-Za-z0-9_\-]+)",
     ]
@@ -1190,23 +1385,45 @@ def _extract_category_value(message: str) -> Optional[str]:
 
 def _extract_form_names(message: str) -> List[str]:
     names: List[str] = []
-    for quoted in re.findall(r"[\"']([^\"']+)[\"']", message):
-        value = quoted.strip()
-        if value:
+    category_value = _extract_category_value(message)
+    for match in re.finditer(r"[\"']([^\"']+)[\"']", message):
+        value = match.group(1).strip()
+        if not value:
+            continue
+        if category_value and value.lower() == category_value.lower():
+            continue
+        window = message[max(0, match.start() - 40):match.end() + 40].lower()
+        if re.search(r"\bcategory(_name)?\b|\bsub_category\b", window):
+            continue
+        if re.search(r"\bform(_name)?s?\b", window):
             names.append(value)
     if names:
         return list(dict.fromkeys(names))[:5]
 
+    if re.search(r"\bform_name\b|\bform name\b", message, re.IGNORECASE):
+        for match in re.finditer(r"[\"']([^\"']+)[\"']", message):
+            value = match.group(1).strip()
+            if not value:
+                continue
+            if category_value and value.lower() == category_value.lower():
+                continue
+            names.append(value)
+        if names:
+            return list(dict.fromkeys(names))[:5]
+
     match = re.search(
-        r"\bform\s+(.+?)\s+and\s+(.+?)(?:\s+both|\s+are|\s+from|\s+between|\s+for|\s+on|\s+in|\s*$)",
+        r"\bforms?\s+(.+?)\s+and\s+(.+?)(?:\s+both|\s+are|\s+from|\s+between|\s+for|\s+on|\s+in|\s*$)",
         message,
         re.IGNORECASE,
     )
     if match:
         for group in match.groups():
             value = group.strip().strip(",.")
-            if value:
-                names.append(value)
+            if not value:
+                continue
+            if category_value and value.lower() == category_value.lower():
+                continue
+            names.append(value)
     return list(dict.fromkeys(names))[:5]
 
 
@@ -1217,12 +1434,22 @@ def _auto_query_from_message(message: str) -> Tuple[Optional[str], Optional[Dict
         return None, None, "No tables found in database."
 
     analysis_request = _is_analysis_request(message)
+    category_value = _extract_category_value(message)
+    mentions_category = bool(re.search(r"\bcategory(_name|_id)?\b", message, re.IGNORECASE))
+    mentions_sub_category = bool(re.search(r"\bsub[_ ]?category(_name|_id)?\b", message, re.IGNORECASE))
+    mentions_form = bool(re.search(r"\bform(_name|_id)?s?\b", message, re.IGNORECASE))
     base_table = _extract_table_from_message(message, tables)
     candidates = _table_candidates(message)
     if base_table is None and candidates:
         base_table = candidates[0]
     if base_table is None and analysis_request and "spc_measurements" in tables:
         base_table = "spc_measurements"
+    if base_table is None and mentions_sub_category and "sub_categories" in tables:
+        base_table = "sub_categories"
+    if base_table is None and mentions_form and "forms" in tables:
+        base_table = "forms"
+    if base_table is None and (category_value or mentions_category) and "product_categories" in tables:
+        base_table = "product_categories"
     if base_table is None and len(tables) == 1:
         base_table = tables[0]
     if base_table is None:
@@ -1237,15 +1464,24 @@ def _auto_query_from_message(message: str) -> Tuple[Optional[str], Optional[Dict
                 break
     if target_table is None and category_tables:
         target_table = category_tables[0] if category_tables[0] != base_table else None
+    if category_value and mentions_sub_category and "sub_categories" in tables:
+        target_table = "sub_categories"
+    if (
+        category_value
+        and mentions_category
+        and not mentions_sub_category
+        and "product_categories" in tables
+    ):
+        target_table = "product_categories"
 
     form_names = _extract_form_names(message)
     form_table: Optional[str] = None
     if form_names and "forms" in tables:
+        form_table = "forms"
         if base_table.lower() == "forms":
             form_table = base_table
-        else:
+        if target_table is None:
             target_table = "forms"
-            form_table = "forms"
 
     join_clauses: List[str] = []
     if target_table and target_table != base_table:
@@ -1263,11 +1499,16 @@ def _auto_query_from_message(message: str) -> Tuple[Optional[str], Optional[Dict
     prefer_raw = analysis_request and base_table.lower() == "spc_measurements"
     metric_col = _pick_metric_column(base_schema) if prefer_raw else None
 
-    category_value = _extract_category_value(message)
     category_col = None
-    if target_table and category_value:
-        target_schema = get_schema(table=target_table)
-        category_col = _pick_category_column(target_schema)
+    category_table = None
+    if category_value:
+        if target_table:
+            target_schema = get_schema(table=target_table)
+            category_col = _pick_category_column(target_schema)
+            category_table = target_table
+        elif base_table in category_tables:
+            category_col = _pick_category_column(base_schema)
+            category_table = base_table
 
     select_cols = []
     params: Dict[str, Any] = {}
@@ -1284,9 +1525,9 @@ def _auto_query_from_message(message: str) -> Tuple[Optional[str], Optional[Dict
             where_clauses.append(f"{base_table}.{dt_col} >= :start_ts")
             where_clauses.append(f"{base_table}.{dt_col} <= :end_ts")
 
-    if category_col and category_value and target_table:
+    if category_col and category_value and category_table:
         params["category_value"] = category_value
-        where_clauses.append(f"{target_table}.{category_col} = :category_value")
+        where_clauses.append(f"{category_table}.{category_col} = :category_value")
     if form_table and form_names:
         placeholders = []
         for idx, name in enumerate(form_names):
@@ -1383,14 +1624,73 @@ def _format_number(value: Any) -> str:
     return f"{num:.3f}"
 
 
+def _capabilities_message() -> str:
+    if SCHEMA_FILE_TABLES:
+        items: List[str] = []
+        for table, cols in SCHEMA_FILE_TABLES.items():
+            if not cols:
+                continue
+            sample = ", ".join(cols[:3])
+            items.append(f"{table} ({sample})")
+            if len(items) >= 4:
+                break
+        if items:
+            return (
+                "I can help with data queries and analysis on: "
+                + "; ".join(items)
+                + ". Tell me which field or filter you need."
+            )
+    return "I can help with data lookups, summaries, and charts. Tell me which table or field you need."
+
+
+def _direct_time_response(message: str) -> Optional[str]:
+    if not message:
+        return None
+    lower = message.lower()
+    if not re.search(r"\b(today|date|day|time|weekday|day of week|now)\b", lower):
+        return None
+    now = datetime.now().astimezone()
+    day_str = now.strftime("%A")
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H:%M")
+    tz = now.strftime("%Z")
+    tz_note = f" ({tz})" if tz else " (local time)"
+
+    wants_time = bool(re.search(r"\btime|now|clock\b", lower))
+    wants_date = bool(re.search(r"\b(today|date|day|weekday|day of week)\b", lower))
+    if wants_time and wants_date:
+        return f"Today is {day_str}, {date_str}. The current time is {time_str}{tz_note}."
+    if wants_time:
+        return f"The current time is {time_str}{tz_note}."
+    if wants_date:
+        return f"Today is {day_str}, {date_str}{tz_note}."
+    return None
+
+
+def _format_simple_result(rows: List[Dict[str, Any]]) -> Optional[str]:
+    if len(rows) != 1:
+        return None
+    row = rows[0]
+    if not isinstance(row, dict) or not row:
+        return None
+    if len(row) == 1:
+        key, value = next(iter(row.items()))
+        return f"Here is the {key}: {_format_number(value)}."
+    if len(row) <= 3:
+        parts = [f"{key} = {_format_number(value)}" for key, value in row.items()]
+        return "Here are the results: " + ", ".join(parts) + "."
+    return None
+
+
 def _datetime_range_line(df: pd.DataFrame) -> Optional[str]:
     columns = list(df.columns)
     preferred = [
         col for col in columns
         if any(key in str(col).lower() for key in ("date", "time", "timestamp"))
     ]
-    candidates = preferred + [col for col in columns if col not in preferred]
-    for col in candidates:
+    if not preferred:
+        return None
+    for col in preferred:
         try:
             dt = pd.to_datetime(df[col], errors="coerce")
         except Exception:
@@ -1827,6 +2127,10 @@ def _summarize_rows(result: Dict[str, Any], message: Optional[str] = None) -> st
             return f"No rows returned for that query.\nSaved raw rows to: {saved_to}"
         return "No rows returned for that query."
 
+    simple_text = _format_simple_result(rows)
+    if simple_text:
+        return simple_text
+
     df = pd.DataFrame(rows)
     lines: List[str] = []
     suffix = " (truncated)" if truncated else ""
@@ -1860,7 +2164,20 @@ def _summarize_rows(result: Dict[str, Any], message: Optional[str] = None) -> st
 
 
 def _looks_unhelpful_response(text: str, result: Optional[Dict[str, Any]] = None) -> bool:
-    if not text or len(text.strip()) < 40:
+    if not text or not text.strip():
+        return True
+    if result:
+        rows = result.get("rows", []) or []
+        if len(rows) == 1 and isinstance(rows[0], dict) and rows[0]:
+            columns = [
+                str(col).lower()
+                for col in rows[0].keys()
+                if isinstance(col, str) and len(col) >= 2
+            ]
+            lower = text.lower()
+            if re.search(r"\d", text) or any(col in lower for col in columns):
+                return False
+    if len(text.strip()) < 40:
         return True
     lower = text.lower()
     generic_markers = (
@@ -1978,30 +2295,37 @@ def extract_tool_calls(resp: Any) -> List[Dict[str, Any]]:
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest) -> ChatResponse:
-    system_instructions = (
-        "You are a helpful assistant for an internal analytics app backed by a SQL database.\n"
-        "Never assume tables, columns, or values; use schema tools first.\n\n"
-        "TOOLS:\n"
-        "- get_schema(table?)\n"
-        "- describe_table(table)\n"
-        "- find_join_path(from_table, to_table)\n"
-        "- run_sql(sql, params?)\n"
-        "- make_plot(...)\n\n"
-        "RULES (keep it tight):\n"
-        "- Before any run_sql, call get_schema/describe_table for each table you will query.\n"
-        "- Use only the columns needed to answer, and apply all user filters (dates, categories, etc.).\n"
-        "- If the user provides form_name values, join forms and filter by forms.form_name.\n"
-        "- If schema hints are provided, use them to pick tables/columns.\n"
-        "- Avoid SELECT * unless sampling or explicitly requested.\n"
-        "- For spc_measurements analysis: first fetch needed raw rows (filtered, required columns), then aggregate/plot.\n"
-        "- Prefer aggregates for trends/metrics; multiple small queries are OK if needed.\n"
-        "- If a join is needed, call find_join_path and use it.\n"
-        "- SQL must be a single SELECT with named params (:start_ts, :end_ts, etc.).\n"
-        "- For charts: run_sql first, then make_plot. Multiple plots are allowed.\n"
-        "- Use line/bar/scatter/hist to best explain the result (not only line).\n"
-        "- Respond with concise numeric summaries and brief interpretation when asked; do not describe JSON schemas.\n"
-        "- Never ask for or reveal secrets.\n"
-    )
+    needs_tools = _requires_tool_call(req.message)
+    if needs_tools:
+        system_instructions = (
+            "You are a helpful assistant for an internal analytics app backed by a SQL database.\n"
+            "Always inspect schema first; never guess tables or columns.\n\n"
+            "TOOLS:\n"
+            "- get_schema(table?)\n"
+            "- describe_table(table)\n"
+            "- find_join_path(from_table, to_table)\n"
+            "- run_sql(sql, params?)\n"
+            "- make_plot(...)\n\n"
+            "RULES:\n"
+            "- Before any run_sql, call get_schema/describe_table for every table you will query.\n"
+            "- Apply all user filters (dates, form_name, category_name). If form_name values are given, join forms and filter forms.form_name.\n"
+            "- If the request is about a category itself, query product_categories directly; otherwise join via sub_categories/forms and filter product_categories.category_name.\n"
+            "- Use only needed columns; avoid SELECT * unless the user asked for a sample.\n"
+            "- For spc_measurements analysis: fetch filtered raw rows first, then aggregate/plot.\n"
+            "- If results are empty or too small, run another query (widen filters) instead of guessing.\n"
+            "- Multiple small queries are OK. Use find_join_path when unsure.\n"
+            "- SQL must be a single SELECT with named params. Do not use LIMIT/max_rows unless the user asks.\n"
+            "- For charts: run_sql first, then make_plot. Multiple plots allowed; include legend_label.\n"
+            "- Provide concise summaries plus interpretation/opinion when asked; do not describe JSON schemas.\n"
+            "- Never ask for or reveal secrets.\n"
+        )
+    else:
+        system_instructions = (
+            "You are a professional, concise assistant.\n"
+            "Answer common chat questions directly.\n"
+            "If a request needs database data you do not have, say what data you can help with.\n"
+            "Avoid guessing or speculation.\n"
+        )
 
 
     # Ollama messages are the same idea: list of {role, content}
@@ -2015,6 +2339,24 @@ def chat(req: ChatRequest) -> ChatResponse:
         "message": req.message,
         "history_len": len(req.history or []),
     })
+    if not needs_tools:
+        quick = _direct_time_response(req.message)
+        if quick:
+            _trace_event(trace, "assistant", {
+                "content": quick,
+                "tool_calls": [],
+            })
+            return ChatResponse(text=quick, trace=trace, plots=[])
+        resp = ollama_chat(messages=messages, tools=None)
+        assistant_msg = resp.get("message", {}) or {}
+        content = assistant_msg.get("content") or ""
+        if not content.strip():
+            content = _capabilities_message()
+        _trace_event(trace, "assistant", {
+            "content": content,
+            "tool_calls": [],
+        })
+        return ChatResponse(text=content, trace=trace, plots=[])
 
     plot_items: List[Dict[str, Any]] = []
     plot_b64: Optional[str] = None
@@ -2045,8 +2387,9 @@ def chat(req: ChatRequest) -> ChatResponse:
                     payload = json.loads(content)
                 except json.JSONDecodeError:
                     payload = None
-                if isinstance(payload, dict) and _record_schema(schema_cache, payload):
-                    schema_checked = True
+                if isinstance(payload, dict):
+                    _record_schema(schema_cache, payload)
+                    schema_checked = bool(schema_cache)
 
     def _respond(
         text: str,
@@ -2113,6 +2456,115 @@ def chat(req: ChatRequest) -> ChatResponse:
         if not tool_calls:
             final_text = assistant_msg.get("content", "") or ""
             if not last_tool_result and _requires_tool_call(req.message):
+                category_value = _extract_category_value(req.message)
+                mentions_sub_category = bool(re.search(r"\bsub[_ ]?category\b", req.message, re.IGNORECASE))
+                mentions_form = bool(re.search(r"\bform(_name|_id)?s?\b", req.message, re.IGNORECASE))
+                mentions_measurements = _message_mentions_table(req.message, "spc_measurements")
+                needs_category_path = (
+                    _is_analysis_request(req.message)
+                    or mentions_sub_category
+                    or mentions_form
+                    or mentions_measurements
+                )
+                if category_value and "product_categories" not in schema_cache:
+                    try:
+                        _trace_event(trace, "tool_call", {
+                            "name": "describe_table",
+                            "arguments": {"table": "product_categories"},
+                            "source": "server",
+                        })
+                        result = describe_table(table="product_categories")
+                    except Exception as exc:
+                        _trace_event(trace, "tool_error", {
+                            "name": "describe_table",
+                            "error": str(exc),
+                            "source": "server",
+                        })
+                        return _respond(
+                            text=f"Tool error: {exc}",
+                            plot_png_base64=plot_b64,
+                            plot_saved_to=plot_saved_to,
+                            query_saved_to=query_saved_to,
+                        )
+                    _record_schema(schema_cache, result)
+                    schema_checked = bool(schema_cache)
+                    _trace_event(trace, "tool_result", {
+                        "name": "describe_table",
+                        "source": "server",
+                        **_trace_schema_result(result),
+                    })
+                    messages.append({
+                        "role": "tool",
+                        "name": "describe_table",
+                        "content": json.dumps(result, ensure_ascii=False, default=str),
+                    })
+                    continue
+                if category_value and needs_category_path and "sub_categories" not in schema_cache:
+                    try:
+                        _trace_event(trace, "tool_call", {
+                            "name": "describe_table",
+                            "arguments": {"table": "sub_categories"},
+                            "source": "server",
+                        })
+                        result = describe_table(table="sub_categories")
+                    except Exception as exc:
+                        _trace_event(trace, "tool_error", {
+                            "name": "describe_table",
+                            "error": str(exc),
+                            "source": "server",
+                        })
+                        return _respond(
+                            text=f"Tool error: {exc}",
+                            plot_png_base64=plot_b64,
+                            plot_saved_to=plot_saved_to,
+                            query_saved_to=query_saved_to,
+                        )
+                    _record_schema(schema_cache, result)
+                    schema_checked = bool(schema_cache)
+                    _trace_event(trace, "tool_result", {
+                        "name": "describe_table",
+                        "source": "server",
+                        **_trace_schema_result(result),
+                    })
+                    messages.append({
+                        "role": "tool",
+                        "name": "describe_table",
+                        "content": json.dumps(result, ensure_ascii=False, default=str),
+                    })
+                    continue
+                if category_value and needs_category_path and "forms" not in schema_cache:
+                    try:
+                        _trace_event(trace, "tool_call", {
+                            "name": "describe_table",
+                            "arguments": {"table": "forms"},
+                            "source": "server",
+                        })
+                        result = describe_table(table="forms")
+                    except Exception as exc:
+                        _trace_event(trace, "tool_error", {
+                            "name": "describe_table",
+                            "error": str(exc),
+                            "source": "server",
+                        })
+                        return _respond(
+                            text=f"Tool error: {exc}",
+                            plot_png_base64=plot_b64,
+                            plot_saved_to=plot_saved_to,
+                            query_saved_to=query_saved_to,
+                        )
+                    _record_schema(schema_cache, result)
+                    schema_checked = bool(schema_cache)
+                    _trace_event(trace, "tool_result", {
+                        "name": "describe_table",
+                        "source": "server",
+                        **_trace_schema_result(result),
+                    })
+                    messages.append({
+                        "role": "tool",
+                        "name": "describe_table",
+                        "content": json.dumps(result, ensure_ascii=False, default=str),
+                    })
+                    continue
                 if (
                     _message_mentions_table(req.message, "spc_measurements")
                     and "spc_measurements" not in schema_cache
@@ -2136,7 +2588,8 @@ def chat(req: ChatRequest) -> ChatResponse:
                             plot_saved_to=plot_saved_to,
                             query_saved_to=query_saved_to,
                         )
-                    schema_checked = bool(schema_cache) or _record_schema(schema_cache, result)
+                    _record_schema(schema_cache, result)
+                    schema_checked = bool(schema_cache)
                     _trace_event(trace, "tool_result", {
                         "name": "describe_table",
                         "source": "server",
@@ -2168,7 +2621,8 @@ def chat(req: ChatRequest) -> ChatResponse:
                             plot_saved_to=plot_saved_to,
                             query_saved_to=query_saved_to,
                         )
-                    schema_checked = bool(schema_cache) or _record_schema(schema_cache, result)
+                    _record_schema(schema_cache, result)
+                    schema_checked = bool(schema_cache)
                     _trace_event(trace, "tool_result", {
                         "name": "describe_table",
                         "source": "server",
@@ -2330,7 +2784,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                     "source": "assistant_sql",
                 })
                 plot_b64, plot_note, plot_saved_to = _maybe_autoplot(
-                    req.message, last_tool_name, last_tool_result, plot_b64, plot_saved_to
+                    req.message, last_tool_name, last_tool_result, plot_b64, plot_saved_to, plot_items
                 )
                 text = _summarize_rows(result, message=req.message)
                 if plot_note:
@@ -2488,10 +2942,13 @@ def chat(req: ChatRequest) -> ChatResponse:
                             schema_prompted = True
                         continue
                     _validate_named_params(args["sql"], args.get("params"))
+                    max_rows = args.get("max_rows")
+                    if max_rows is not None and not _user_requested_limit(req.message):
+                        max_rows = None
                     result = run_sql(
                         sql=args["sql"],
                         params=args.get("params"),
-                        max_rows=args.get("max_rows"),
+                        max_rows=max_rows,
                     )
                     last_tool_result = result
                     last_tool_name = "run_sql"
@@ -2588,7 +3045,8 @@ def chat(req: ChatRequest) -> ChatResponse:
                         table=args.get("table"),
                         max_tables=args.get("max_tables"),
                     )
-                    schema_checked = bool(schema_cache) or _record_schema(schema_cache, result)
+                    _record_schema(schema_cache, result)
+                    schema_checked = bool(schema_cache)
                     last_tool_error = None
                     _trace_event(trace, "tool_result", {
                         "name": "get_schema",
@@ -2625,7 +3083,8 @@ def chat(req: ChatRequest) -> ChatResponse:
                 elif name == "describe_table":
                     _require_args(args, ["table"], "describe_table")
                     result = describe_table(table=args["table"])
-                    schema_checked = bool(schema_cache) or _record_schema(schema_cache, result)
+                    _record_schema(schema_cache, result)
+                    schema_checked = bool(schema_cache)
                     last_tool_error = None
                     _trace_event(trace, "tool_result", {
                         "name": "describe_table",
