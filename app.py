@@ -21,14 +21,24 @@ from __future__ import annotations
 # - Apply category_name filters to base category tables when no join is required.
 # - Fix datetime column detection and widen analysis intent for "production values".
 # - Count-style questions return a single COUNT(*) without day grouping.
+# - Resolve unclear terms by probing product/sub-category/form names in order.
+# - For category measurement queries, include form/field context and filter out archived sub-categories.
+# - Prefer spc_measurements as base table for measurement/production requests.
 # --- Response tone and safety ---
 # - Return human-friendly replies for single-row lookups and avoid datetime ranges on numeric IDs.
 # - Add common-chat handling with safe fallbacks and direct date/time replies.
 # - Avoid answering non-time questions with date replies; add safe weather fallback.
+# - Ensure final replies follow the user's language (English/Chinese).
+# --- Tool routing ---
+# - Treat spc/measurement/production/data queries as DB requests (avoid generic chat replies).
 # --- Workflow visibility ---
 # - Add workflow + query logging in responses and return friendlier error messages.
 # --- Analysis summaries ---
 # - Provide opinion-focused analysis summaries with sample rows and references.
+# 2026-01-13
+# --- Update log maintenance ---
+# - Refreshed update log date per request.
+# - Documented a local uvicorn run hint in requirements.txt.
 
 import ast
 import base64
@@ -1147,6 +1157,14 @@ def _is_analysis_request(message: str) -> bool:
     ))
 
 
+def _is_measurement_request(message: str) -> bool:
+    return bool(re.search(
+        r"\b(spc|measurement|measurements|value|values|production|inspect|trend|condition)\b",
+        message,
+        re.IGNORECASE,
+    ))
+
+
 def _is_count_request(message: str) -> bool:
     return bool(re.search(
         r"\b(how many|count|number of|total)\b",
@@ -1159,7 +1177,7 @@ def _requires_tool_call(message: str) -> bool:
     if re.search(r"\d{4}-\d{2}-\d{2}", message):
         return True
     return bool(re.search(
-        r"\b(table|rows?|columns?|schema|database|sql|analy|analysis|plot|graph|chart|trend|average|mean|median|count|sum|min|max|category|category_name|category_id|sub_category|form|form_name|form_id)\b",
+        r"\b(table|rows?|columns?|schema|database|sql|analy|analysis|plot|graph|chart|trend|average|mean|median|count|sum|min|max|category|category_name|category_id|sub_category|form|form_name|form_id|spc|measurement|measurements|value|values|production|inspect|inspection|data|records?)\b",
         message,
         re.IGNORECASE,
     ))
@@ -1267,6 +1285,8 @@ def _schema_hints_from_file(message: str) -> str:
         or _is_analysis_request(message)
     ) and "spc_measurements" in SCHEMA_FILE_TABLES:
         tables.append("spc_measurements")
+        if "form_fields" in SCHEMA_FILE_TABLES:
+            tables.append("form_fields")
     if re.search(r"\bcategory(_name)?\b", message, re.IGNORECASE):
         if "product_categories" in SCHEMA_FILE_TABLES:
             tables.append("product_categories")
@@ -1294,6 +1314,13 @@ def _schema_hints_from_file(message: str) -> str:
             continue
         cols_line = ", ".join(cols[:20]) + (" ..." if len(cols) > 20 else "")
         lines.append(f"{table}: {cols_line}")
+    if "spc_measurements" in tables and "form_fields" in tables:
+        lines.append(
+            "Join: spc_measurements.form_id = form_fields.form_id "
+            "AND spc_measurements.field_index = form_fields.field_index"
+        )
+    if "form_fields" in tables and "forms" in tables:
+        lines.append("Join: form_fields.form_id = forms.form_id")
     if "spc_measurements" in tables and "forms" in tables:
         lines.append("Join: spc_measurements.form_id = forms.form_id")
     if (
@@ -1305,6 +1332,7 @@ def _schema_hints_from_file(message: str) -> str:
             "Join: forms.sub_category_id = sub_categories.sub_category_id "
             "AND sub_categories.category_id = product_categories.category_id"
         )
+        lines.append("Preferred path: spc_measurements -> form_fields -> forms -> sub_categories -> product_categories")
     if not lines:
         return ""
     return "Schema hints (from schema.sql):\n" + "\n".join(lines)
@@ -1405,12 +1433,93 @@ def _extract_category_value(message: str) -> Optional[str]:
         r"category_name\s+['\"]([^'\"]+)['\"]",
         r"category name\s+['\"]([^'\"]+)['\"]",
         r"category\s+['\"]([^'\"]+)['\"]",
-        r"category\s+([A-Za-z0-9_\-]+)",
+        r"\bcategory(?:_name| name)?\s+([A-Za-z0-9][A-Za-z0-9 _-]{1,40}?)(?:\s+(?:during|from|to|between|for|in|on|under)\b|$)",
     ]
     for pattern in patterns:
         match = re.search(pattern, message, re.IGNORECASE)
         if match:
             return match.group(1)
+    return None
+
+
+def _extract_label_candidates(message: str) -> List[str]:
+    if not message:
+        return []
+    candidates: List[str] = []
+    for match in re.finditer(r"[\"']([^\"']+)[\"']", message):
+        value = match.group(1).strip()
+        if value:
+            candidates.append(value)
+    line_match = re.search(
+        r"\b([A-Za-z0-9][A-Za-z0-9 _-]{1,40})\s+line\b",
+        message,
+        re.IGNORECASE,
+    )
+    if line_match:
+        candidates.append(line_match.group(1).strip())
+    prep_match = re.search(
+        r"\b(?:in|under|for|within|on)\s+([A-Za-z0-9][A-Za-z0-9 _-]{1,40})",
+        message,
+        re.IGNORECASE,
+    )
+    if prep_match:
+        candidates.append(prep_match.group(1).strip())
+    stopwords = {
+        "today", "yesterday", "tomorrow", "this", "last", "next",
+        "month", "week", "year", "during", "from", "to", "between",
+        "for", "in", "on", "at", "of", "and",
+    }
+    cleaned: List[str] = []
+    for candidate in candidates:
+        tokens = candidate.split()
+        while tokens and tokens[-1].lower() in stopwords:
+            tokens.pop()
+        value = " ".join(tokens).strip()
+        if value:
+            cleaned.append(value)
+        if value.lower().endswith(" line"):
+            cleaned.append(value[:-5].strip())
+    return list(dict.fromkeys(cleaned))
+
+
+def _resolve_label_target(
+    candidates: List[str],
+    tables: List[str],
+    query_log: Optional[List[Dict[str, Any]]] = None,
+    workflow: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    if not candidates:
+        return None
+    checks = [
+        ("product_categories", "category_name"),
+        ("sub_categories", "sub_category_name"),
+        ("forms", "form_name"),
+    ]
+    for table, column in checks:
+        if table not in tables:
+            continue
+        for value in candidates:
+            sql = f"SELECT COUNT(*) AS match_count FROM {table} WHERE {column} ILIKE :pattern"
+            params = {"pattern": f"%{value}%"}
+            try:
+                result = run_sql(sql=sql, params=params, max_rows=None)
+            except Exception:
+                result = None
+            if query_log is not None and result is not None:
+                _log_query(query_log, sql, params, "resolver", result=result)
+            if workflow is not None:
+                _workflow_add(workflow, f"Resolver checked {table}.{column} for '{value}'.")
+            if result and result.get("rows"):
+                match_count = result["rows"][0].get("match_count")
+                try:
+                    if int(match_count) > 0:
+                        return {
+                            "table": table,
+                            "column": column,
+                            "value": value,
+                        }
+                except (TypeError, ValueError):
+                    continue
     return None
 
 
@@ -1458,22 +1567,44 @@ def _extract_form_names(message: str) -> List[str]:
     return list(dict.fromkeys(names))[:5]
 
 
-def _auto_query_from_message(message: str) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[str]]:
+def _auto_query_from_message(
+    message: str,
+    query_log: Optional[List[Dict[str, Any]]] = None,
+    workflow: Optional[List[str]] = None,
+    user_lang: str = "en",
+) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[str]]:
     inspector = inspect(engine)
     tables = inspector.get_table_names()
     if not tables:
         return None, None, "No tables found in database."
 
     analysis_request = _is_analysis_request(message)
+    measurement_request = _is_measurement_request(message)
     category_value = _extract_category_value(message)
+    form_names = _extract_form_names(message)
     mentions_category = bool(re.search(r"\bcategory(_name|_id)?\b", message, re.IGNORECASE))
     mentions_sub_category = bool(re.search(r"\bsub[_ ]?category(_name|_id)?\b", message, re.IGNORECASE))
     mentions_form = bool(re.search(r"\bform(_name|_id)?s?\b", message, re.IGNORECASE))
+    resolved_target = None
+    if not category_value and not form_names:
+        candidates = _extract_label_candidates(message)
+        if candidates:
+            resolved_target = _resolve_label_target(candidates, tables, query_log, workflow)
+            if resolved_target:
+                if resolved_target["table"] == "forms":
+                    form_names = [resolved_target["value"]]
+                else:
+                    category_value = resolved_target["value"]
+                    mentions_category = True
+            else:
+                return None, None, _t(user_lang, "label_no_match", value=candidates[0])
     base_table = _extract_table_from_message(message, tables)
     candidates = _table_candidates(message)
-    if base_table is None and candidates:
+    if measurement_request and "spc_measurements" in tables:
+        base_table = "spc_measurements"
+    elif base_table is None and candidates:
         base_table = candidates[0]
-    if base_table is None and analysis_request and "spc_measurements" in tables:
+    elif base_table is None and analysis_request and "spc_measurements" in tables:
         base_table = "spc_measurements"
     if base_table is None and mentions_sub_category and "sub_categories" in tables:
         base_table = "sub_categories"
@@ -1488,7 +1619,9 @@ def _auto_query_from_message(message: str) -> Tuple[Optional[str], Optional[Dict
 
     category_tables = [t for t in tables if "category" in t.lower()]
     target_table = None
-    if candidates:
+    if resolved_target:
+        target_table = resolved_target["table"]
+    elif candidates:
         for t in candidates:
             if t != base_table:
                 target_table = t
@@ -1505,7 +1638,6 @@ def _auto_query_from_message(message: str) -> Tuple[Optional[str], Optional[Dict
     ):
         target_table = "product_categories"
 
-    form_names = _extract_form_names(message)
     form_table: Optional[str] = None
     if form_names and "forms" in tables:
         form_table = "forms"
@@ -1530,6 +1662,21 @@ def _auto_query_from_message(message: str) -> Tuple[Optional[str], Optional[Dict
     count_request = _is_count_request(message)
     prefer_raw = analysis_request and base_table.lower() == "spc_measurements"
     metric_col = _pick_metric_column(base_schema) if prefer_raw else None
+
+    join_tables = set()
+    for clause in join_clauses:
+        match = re.search(r"\bJOIN\s+([A-Za-z_][A-Za-z0-9_]*)\b", clause, re.IGNORECASE)
+        if match:
+            join_tables.add(match.group(1))
+
+    base_columns = {
+        col.get("name")
+        for col in base_schema.get("columns", [])
+        if isinstance(col, dict) and col.get("name")
+    }
+    forms_schema = get_schema(table="forms") if "forms" in join_tables else None
+    form_fields_schema = get_schema(table="form_fields") if "form_fields" in join_tables else None
+    sub_category_schema = get_schema(table="sub_categories") if "sub_categories" in join_tables else None
 
     category_col = None
     category_table = None
@@ -1568,16 +1715,41 @@ def _auto_query_from_message(message: str) -> Tuple[Optional[str], Optional[Dict
             placeholders.append(f":{key}")
         if placeholders:
             where_clauses.append(f"{form_table}.form_name IN ({', '.join(placeholders)})")
+    if sub_category_schema:
+        sub_cols = {
+            col.get("name")
+            for col in sub_category_schema.get("columns", [])
+            if isinstance(col, dict) and col.get("name")
+        }
+        if "sub_category_name" in sub_cols and not re.search(r"封存|archived", message, re.IGNORECASE):
+            where_clauses.append("sub_categories.sub_category_name <> '封存'")
 
     if prefer_raw:
         if dt_col:
             select_cols.append(f"{base_table}.{dt_col}")
+        for col in ("form_id", "field_index", "sample_index", "line_name"):
+            if col in base_columns:
+                select_cols.append(f"{base_table}.{col}")
         if metric_col:
             select_cols.append(f"{base_table}.{metric_col}")
-        if form_table:
-            select_cols.append(f"{form_table}.form_name")
-        if category_col and target_table:
-            select_cols.append(f"{target_table}.{category_col}")
+        if forms_schema:
+            forms_cols = {
+                col.get("name")
+                for col in forms_schema.get("columns", [])
+                if isinstance(col, dict) and col.get("name")
+            }
+            if "form_name" in forms_cols:
+                select_cols.append("forms.form_name")
+        if form_fields_schema:
+            field_cols = {
+                col.get("name")
+                for col in form_fields_schema.get("columns", [])
+                if isinstance(col, dict) and col.get("name")
+            }
+            if "product_characteristic" in field_cols:
+                select_cols.append("form_fields.product_characteristic")
+        if category_col and category_table:
+            select_cols.append(f"{category_table}.{category_col}")
     else:
         if count_request:
             select_cols.append("COUNT(*) AS count")
@@ -1600,7 +1772,10 @@ def _auto_query_from_message(message: str) -> Tuple[Optional[str], Optional[Dict
         sql_parts.append("WHERE " + " AND ".join(where_clauses))
     if dt_col:
         if prefer_raw:
-            sql_parts.append(f"ORDER BY {base_table}.{dt_col}")
+            if "sample_index" in base_columns:
+                sql_parts.append(f"ORDER BY {base_table}.{dt_col}, {base_table}.sample_index")
+            else:
+                sql_parts.append(f"ORDER BY {base_table}.{dt_col}")
         elif not count_request:
             sql_parts.append("GROUP BY day")
             sql_parts.append("ORDER BY day")
@@ -1658,26 +1833,98 @@ def _format_number(value: Any) -> str:
     return f"{num:.3f}"
 
 
-def _capabilities_message() -> str:
+def _detect_user_language(message: str) -> str:
+    if not message:
+        return "en"
+    if re.search(r"[\u4e00-\u9fff]", message):
+        return "zh"
+    return "en"
+
+
+def _t(lang: str, key: str, **kwargs: Any) -> str:
+    strings = {
+        "en": {
+            "capabilities_intro": "I can help with data queries and analysis on: {items}. Tell me which field or filter you need.",
+            "capabilities_generic": "I can help with data lookups, summaries, and charts. Tell me which table or field you need.",
+            "tool_error_base": "I couldn't complete that request with the available data.",
+            "no_rows": "No rows returned for that query.",
+            "no_rows_saved": "No rows returned for that query.\nRaw rows saved to: {saved_to}",
+            "raw_saved": "Raw rows saved to: {saved_to}",
+            "found_rows": "I found {count} row(s){suffix}.",
+            "columns": "Columns: {cols}",
+            "plot_interpretation": "Plot interpretation:",
+            "returned_rows": "Returned {count} row(s):",
+            "plot_generated": "Plot generated.",
+            "plot_generated_saved": "Plot generated. Saved to: {saved_to}",
+            "tool_result_available": "Tool result available.",
+            "sample_rows": "Sample rows:",
+            "opinion": "Opinion: {opinion}",
+            "insufficient_data": "The data is too limited to draw a strong conclusion.",
+            "here_is": "Here is the {key}: {value}.",
+            "results": "Here are the results: {pairs}.",
+            "needs_db_data": (
+                "I need to call a tool (get_schema or run_sql) before plotting or analysis. "
+                "Try a tool-capable model or rephrase the question."
+            ),
+            "direct_time_date": "Today is {day}, {date}{tz}.",
+            "direct_time_time": "The current time is {time}{tz}.",
+            "direct_time_both": "Today is {day}, {date}. The current time is {time}{tz}.",
+            "weather_no_access": "I don't have live weather access here. {capabilities}",
+            "tool_loop_limit": "I couldn't finish the request within the tool loop limit. Try narrowing the question.",
+            "label_no_match": "I couldn't match '{value}' to product categories, sub-categories, or forms. If you can provide the category list, I can use it.",
+        },
+        "zh": {
+            "capabilities_intro": "我可以查詢與分析這些資料：{items}。請告訴我需要的欄位或條件。",
+            "capabilities_generic": "我可以幫你做資料查詢、彙總和圖表。請告訴我需要的表或欄位。",
+            "tool_error_base": "我暫時無法用現有資料完成這個請求。",
+            "no_rows": "這次查詢沒有返回資料。",
+            "no_rows_saved": "這次查詢沒有返回資料。\n原始資料已儲存：{saved_to}",
+            "raw_saved": "原始資料已儲存：{saved_to}",
+            "found_rows": "我找到了 {count} 條記錄{suffix}。",
+            "columns": "欄位：{cols}",
+            "plot_interpretation": "圖表解讀：",
+            "returned_rows": "回傳 {count} 條記錄：",
+            "plot_generated": "圖表已產生。",
+            "plot_generated_saved": "圖表已產生，儲存到：{saved_to}",
+            "tool_result_available": "工具結果已就緒。",
+            "sample_rows": "部分樣本：",
+            "opinion": "觀點：{opinion}",
+            "insufficient_data": "資料量較少，暫時無法得出明確結論。",
+            "here_is": "{key} 是 {value}。",
+            "results": "結果為：{pairs}。",
+            "needs_db_data": "我需要先呼叫工具（get_schema 或 run_sql）才能繪圖或分析。請使用可呼叫工具的模型或換個說法。",
+            "direct_time_date": "今天是{day}，{date}{tz}。",
+            "direct_time_time": "目前時間是 {time}{tz}。",
+            "direct_time_both": "今天是{day}，{date}。目前時間是 {time}{tz}。",
+            "weather_no_access": "這裡無法取得即時天氣。{capabilities}",
+            "tool_loop_limit": "我沒能在工具呼叫次數限制內完成請求。可以試著把問題縮小一點。",
+            "label_no_match": "我無法把「{value}」匹配到產品類別、子類別或表單名稱。如果你能提供類別清單，我就能繼續。",
+        },
+    }
+    bundle = strings.get(lang, strings["en"])
+    template = bundle.get(key, strings["en"].get(key, ""))
+    return template.format(**kwargs)
+
+
+def _capabilities_message(lang: str) -> str:
     if SCHEMA_FILE_TABLES:
         items: List[str] = []
         for table, cols in SCHEMA_FILE_TABLES.items():
             if not cols:
                 continue
             sample = ", ".join(cols[:3])
-            items.append(f"{table} ({sample})")
+            if lang == "zh":
+                items.append(f"{table}（{sample}）")
+            else:
+                items.append(f"{table} ({sample})")
             if len(items) >= 4:
                 break
         if items:
-            return (
-                "I can help with data queries and analysis on: "
-                + "; ".join(items)
-                + ". Tell me which field or filter you need."
-            )
-    return "I can help with data lookups, summaries, and charts. Tell me which table or field you need."
+            return _t(lang, "capabilities_intro", items="; ".join(items))
+    return _t(lang, "capabilities_generic")
 
 
-def _direct_time_response(message: str) -> Optional[str]:
+def _direct_time_response(message: str, lang: str) -> Optional[str]:
     if not message:
         return None
     lower = message.lower()
@@ -1690,31 +1937,42 @@ def _direct_time_response(message: str) -> Optional[str]:
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H:%M")
     tz = now.strftime("%Z")
-    tz_note = f" ({tz})" if tz else " (local time)"
+    tz_note = f" ({tz})" if tz else ("（本地時間）" if lang == "zh" else " (local time)")
 
     wants_time = bool(re.search(r"\btime|clock\b", lower))
     wants_date = bool(re.search(r"\b(date|day|weekday|day of week)\b", lower))
     if not wants_time and not wants_date:
         return None
+    if lang == "zh":
+        day_map = {
+            "Monday": "星期一",
+            "Tuesday": "星期二",
+            "Wednesday": "星期三",
+            "Thursday": "星期四",
+            "Friday": "星期五",
+            "Saturday": "星期六",
+            "Sunday": "星期日",
+        }
+        day_str = day_map.get(day_str, day_str)
     if wants_time and wants_date:
-        return f"Today is {day_str}, {date_str}. The current time is {time_str}{tz_note}."
+        return _t(lang, "direct_time_both", day=day_str, date=date_str, time=time_str, tz=tz_note)
     if wants_time:
-        return f"The current time is {time_str}{tz_note}."
+        return _t(lang, "direct_time_time", time=time_str, tz=tz_note)
     if wants_date:
-        return f"Today is {day_str}, {date_str}{tz_note}."
+        return _t(lang, "direct_time_date", day=day_str, date=date_str, tz=tz_note)
     return None
 
 
-def _direct_weather_response(message: str) -> Optional[str]:
+def _direct_weather_response(message: str, lang: str) -> Optional[str]:
     if not message:
         return None
     lower = message.lower()
     if not re.search(r"\b(weather|temperature|forecast|rain|snow|wind|humidity|storm)\b", lower):
         return None
-    return "I don't have live weather access here. " + _capabilities_message()
+    return _t(lang, "weather_no_access", capabilities=_capabilities_message(lang))
 
 
-def _format_simple_result(rows: List[Dict[str, Any]]) -> Optional[str]:
+def _format_simple_result(rows: List[Dict[str, Any]], lang: str) -> Optional[str]:
     if len(rows) != 1:
         return None
     row = rows[0]
@@ -1722,10 +1980,10 @@ def _format_simple_result(rows: List[Dict[str, Any]]) -> Optional[str]:
         return None
     if len(row) == 1:
         key, value = next(iter(row.items()))
-        return f"Here is the {key}: {_format_number(value)}."
+        return _t(lang, "here_is", key=key, value=_format_number(value))
     if len(row) <= 3:
         parts = [f"{key} = {_format_number(value)}" for key, value in row.items()]
-        return "Here are the results: " + ", ".join(parts) + "."
+        return _t(lang, "results", pairs=", ".join(parts))
     return None
 
 
@@ -1743,26 +2001,29 @@ def _format_sample_rows(rows: List[Dict[str, Any]], limit: int = 5) -> Optional[
     return lines or None
 
 
-def _analysis_summary(result: Dict[str, Any], message: Optional[str]) -> str:
+def _analysis_summary(result: Dict[str, Any], message: Optional[str], lang: str) -> str:
     rows = result.get("rows", []) or []
     saved_to = result.get("saved_to")
     opinion = None
     plot_info = _infer_plot_config(rows)
     if plot_info:
-        for line in _plot_insight_lines(plot_info):
+        for line in _plot_insight_lines(plot_info, lang):
             if line.startswith("Opinion:"):
                 opinion = line[len("Opinion:"):].strip()
                 break
+            if line.startswith("觀點："):
+                opinion = line[len("觀點："):].strip()
+                break
     if not opinion:
-        opinion = "The data is too limited to draw a strong conclusion."
+        opinion = _t(lang, "insufficient_data")
 
-    lines = [f"Opinion: {opinion}"]
+    lines = [_t(lang, "opinion", opinion=opinion)]
     sample_lines = _format_sample_rows(rows, limit=5)
     if sample_lines:
-        lines.append("Sample rows:")
+        lines.append(_t(lang, "sample_rows"))
         lines.extend(sample_lines)
     if saved_to:
-        lines.append(f"Raw rows saved to: {saved_to}")
+        lines.append(_t(lang, "raw_saved", saved_to=saved_to))
     return "\n".join(lines)
 
 
@@ -1792,9 +2053,9 @@ def _log_query(
     query_log.append(entry)
 
 
-def _friendly_tool_error(message: Optional[str], error: str) -> str:
-    base = "I couldn't complete that request with the available data."
-    return f"{base} {_capabilities_message()}"
+def _friendly_tool_error(message: Optional[str], error: str, lang: str) -> str:
+    base = _t(lang, "tool_error_base")
+    return f"{base} {_capabilities_message(lang)}"
 
 
 def _datetime_range_line(df: pd.DataFrame) -> Optional[str]:
@@ -2047,6 +2308,7 @@ def _infer_plot_config(
 
 def _plot_insight_lines(
     plot_info: Tuple[str, Any, Any, List[Dict[str, Any]], Dict[str, Any]],
+    lang: str,
 ) -> List[str]:
     kind, x_key, y_key, data, meta = plot_info
     series_label = meta.get("series_label") or str(y_key)
@@ -2056,9 +2318,12 @@ def _plot_insight_lines(
 
     lines: List[str] = []
     if kind == "line":
-        lines.append(
-            f"Why this graph: it shows {series_label} over {x_key} to surface the trend and spikes."
-        )
+        if lang == "zh":
+            lines.append(f"為什麼畫這個圖：展示 {series_label} 隨 {x_key} 的變化，便於觀察趨勢和波動。")
+        else:
+            lines.append(
+                f"Why this graph: it shows {series_label} over {x_key} to surface the trend and spikes."
+            )
         df[y_key] = pd.to_numeric(df[y_key], errors="coerce")
         df = df.dropna(subset=[y_key])
         if df.empty or len(df) < 2:
@@ -2115,27 +2380,55 @@ def _plot_insight_lines(
             min_idx = y_series.idxmin()
             max_x = _format_x_value(df.loc[max_idx, "_x"])
             min_x = _format_x_value(df.loc[min_idx, "_x"])
-            extra = (
-                f" Peaks at {_format_number(max_val)} around {max_x}, "
-                f"with a low of {_format_number(min_val)} around {min_x}."
+            if lang == "zh":
+                extra = (
+                    f" 峰值約為 {_format_number(max_val)}（{max_x}），"
+                    f"低點約為 {_format_number(min_val)}（{min_x}）。"
+                )
+            else:
+                extra = (
+                    f" Peaks at {_format_number(max_val)} around {max_x}, "
+                    f"with a low of {_format_number(min_val)} around {min_x}."
+                )
+
+        if lang == "zh":
+            trend_map = {
+                "upward": "上升",
+                "downward": "下降",
+                "mostly flat": "基本持平",
+                "flat": "持平",
+            }
+            var_map = {"low": "低", "moderate": "中", "high": "高"}
+            lines.append(
+                f"圖中顯示：趨勢{trend_map.get(trend, trend)}（{change_desc}）；波動程度{var_map.get(var_desc, var_desc)}。{extra}"
             )
-
-        lines.append(
-            f"What it shows: {trend} trend ({change_desc}); variability is {var_desc}.{extra}"
-        )
-
-        if trend == "upward":
-            opinion = "Values drift upward; if that is undesirable, review changes around the rise."
-        elif trend == "downward":
-            opinion = "Values trend downward; confirm this matches expectations and watch for continued drift."
+            if trend == "upward":
+                opinion = "數值有上升趨勢，如不符合預期，建議關注上升時段的變化。"
+            elif trend == "downward":
+                opinion = "數值呈下降趨勢，請確認是否符合預期並留意持續下降。"
+            else:
+                opinion = "整體較穩定，重點關注個別波動點。"
+            lines.append(f"觀點：{opinion}")
         else:
-            opinion = "Values look stable overall; focus on isolated spikes rather than a sustained shift."
-        lines.append(f"Opinion: {opinion}")
+            lines.append(
+                f"What it shows: {trend} trend ({change_desc}); variability is {var_desc}.{extra}"
+            )
+            if trend == "upward":
+                opinion = "Values drift upward; if that is undesirable, review changes around the rise."
+            elif trend == "downward":
+                opinion = "Values trend downward; confirm this matches expectations and watch for continued drift."
+            else:
+                opinion = "Values look stable overall; focus on isolated spikes rather than a sustained shift."
+            lines.append(f"Opinion: {opinion}")
         return lines
-
-    lines.append(
-        f"Why this graph: it compares {series_label} across {x_key} categories to show relative differences."
-    )
+    if lang == "zh":
+        lines.append(
+            f"為什麼畫這個圖：比較各 {x_key} 的 {series_label}，突出差異。"
+        )
+    else:
+        lines.append(
+            f"Why this graph: it compares {series_label} across {x_key} categories to show relative differences."
+        )
     df[y_key] = pd.to_numeric(df[y_key], errors="coerce")
     df = df.dropna(subset=[y_key]).sort_values(y_key, ascending=False)
     if df.empty:
@@ -2150,12 +2443,21 @@ def _plot_insight_lines(
     top_sum = top[y_key].sum()
     concentration = top_sum / total if total else None
     spread = "concentrated" if concentration and concentration >= 0.7 else "spread"
-    lines.append(f"What it shows: top categories are {top_items}; distribution is {spread}.")
-    if spread == "concentrated":
-        opinion = "A few categories dominate; prioritize those segments for impact."
+    if lang == "zh":
+        spread_text = "集中" if spread == "concentrated" else "分散"
+        lines.append(f"圖中顯示：排名靠前的是 {top_items}；分佈較{spread_text}。")
+        if spread == "concentrated":
+            opinion = "少數類別佔主導，建議優先關注這些類別。"
+        else:
+            opinion = "沒有單一類別佔主導，變化比較分散。"
+        lines.append(f"觀點：{opinion}")
     else:
-        opinion = "No single category dominates; changes are broadly distributed."
-    lines.append(f"Opinion: {opinion}")
+        lines.append(f"What it shows: top categories are {top_items}; distribution is {spread}.")
+        if spread == "concentrated":
+            opinion = "A few categories dominate; prioritize those segments for impact."
+        else:
+            opinion = "No single category dominates; changes are broadly distributed."
+        lines.append(f"Opinion: {opinion}")
     return lines
 
 
@@ -2233,34 +2535,34 @@ def _auto_plot_from_result(
     return items, "\n".join(notes) if notes else None
 
 
-def _summarize_rows(result: Dict[str, Any], message: Optional[str] = None) -> str:
+def _summarize_rows(result: Dict[str, Any], message: Optional[str], lang: str) -> str:
     rows = result.get("rows", []) or []
     truncated = bool(result.get("truncated", False))
     saved_to = result.get("saved_to")
     if not rows:
         if saved_to:
-            return f"No rows returned for that query.\nSaved raw rows to: {saved_to}"
-        return "No rows returned for that query."
+            return _t(lang, "no_rows_saved", saved_to=saved_to)
+        return _t(lang, "no_rows")
 
-    simple_text = _format_simple_result(rows)
+    simple_text = _format_simple_result(rows, lang)
     if simple_text:
         return simple_text
     if message and _is_analysis_request(message):
-        return _analysis_summary(result, message)
+        return _analysis_summary(result, message, lang)
 
     df = pd.DataFrame(rows)
     lines: List[str] = []
-    suffix = " (truncated)" if truncated else ""
-    lines.append(f"I found {len(rows)} row(s){suffix}.")
+    suffix = "（已截斷）" if truncated and lang == "zh" else (" (truncated)" if truncated else "")
+    lines.append(_t(lang, "found_rows", count=len(rows), suffix=suffix))
     if saved_to:
-        lines.append(f"Raw rows saved to: {saved_to}")
+        lines.append(_t(lang, "raw_saved", saved_to=saved_to))
 
     columns = [str(c) for c in df.columns.tolist()]
     if columns:
         if len(columns) <= 8:
-            lines.append("Columns: " + ", ".join(columns))
+            lines.append(_t(lang, "columns", cols=", ".join(columns)))
         else:
-            lines.append("Columns: " + ", ".join(columns[:8]) + " ...")
+            lines.append(_t(lang, "columns", cols=", ".join(columns[:8]) + " ..."))
 
     date_line = _datetime_range_line(df)
     if date_line:
@@ -2275,8 +2577,8 @@ def _summarize_rows(result: Dict[str, Any], message: Optional[str] = None) -> st
     if message and (_wants_plot(message) or _needs_opinion(message)):
         plot_info = _infer_plot_config(rows)
         if plot_info:
-            lines.append("Plot interpretation:")
-            lines.extend(_plot_insight_lines(plot_info))
+            lines.append(_t(lang, "plot_interpretation"))
+            lines.extend(_plot_insight_lines(plot_info, lang))
     return "\n".join(lines)
 
 
@@ -2331,7 +2633,8 @@ def _looks_unhelpful_response(text: str, result: Optional[Dict[str, Any]] = None
 def _format_tool_fallback(
     name: str,
     result: Dict[str, Any],
-    message: Optional[str] = None,
+    message: Optional[str],
+    lang: str,
 ) -> str:
     if name == "run_sql":
         rows = result.get("rows", [])
@@ -2340,17 +2643,17 @@ def _format_tool_fallback(
         saved_to = result.get("saved_to")
         if row_count <= 20 and not truncated:
             if message and (_wants_plot(message) or _needs_opinion(message)):
-                return _summarize_rows(result, message=message)
+                return _summarize_rows(result, message=message, lang=lang)
             rows_json = json.dumps(rows, indent=2, ensure_ascii=True, default=str)
-            suffix = f"\n\nSaved raw rows to: {saved_to}" if saved_to else ""
-            return f"Returned {row_count} row(s):\n\n{rows_json}{suffix}"
-        return _summarize_rows(result, message=message)
+            suffix = f"\n\n{_t(lang, 'raw_saved', saved_to=saved_to)}" if saved_to else ""
+            return f"{_t(lang, 'returned_rows', count=row_count)}\n\n{rows_json}{suffix}"
+        return _summarize_rows(result, message=message, lang=lang)
     if name == "make_plot":
         saved_to = result.get("saved_to")
         if saved_to:
-            return f"Plot generated. Saved to: {saved_to}"
-        return "Plot generated."
-    return "Tool result available."
+            return _t(lang, "plot_generated_saved", saved_to=saved_to)
+        return _t(lang, "plot_generated")
+    return _t(lang, "tool_result_available")
 
 
 def _maybe_autoplot(
@@ -2375,11 +2678,8 @@ def _maybe_autoplot(
     return last_plot.get("png_base64"), note, last_plot.get("saved_to")
 
 
-def _needs_db_data_message() -> str:
-    return (
-        "I need to call a tool (get_schema or run_sql) before plotting or analysis. "
-        "Try a tool-capable model or rephrase the question."
-    )
+def _needs_db_data_message(lang: str) -> str:
+    return _t(lang, "needs_db_data")
 
 
 def _force_json_tool_message() -> str:
@@ -2412,7 +2712,12 @@ def extract_tool_calls(resp: Any) -> List[Dict[str, Any]]:
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest) -> ChatResponse:
+    user_lang = _detect_user_language(req.message)
     needs_tools = _requires_tool_call(req.message)
+    if user_lang == "zh":
+        language_note = "最終回覆請使用繁體中文。"
+    else:
+        language_note = "Respond in English."
     if needs_tools:
         system_instructions = (
             "You are a helpful assistant for an internal analytics app backed by a SQL database.\n"
@@ -2426,15 +2731,21 @@ def chat(req: ChatRequest) -> ChatResponse:
             "RULES:\n"
             "- Before any run_sql, call get_schema/describe_table for every table you will query.\n"
             "- Apply all user filters (dates, form_name, category_name). If form_name values are given, join forms and filter forms.form_name.\n"
-            "- If the request is about a category itself, query product_categories directly; otherwise join via sub_categories/forms and filter product_categories.category_name.\n"
-            "- Use only needed columns; avoid SELECT * unless the user asked for a sample.\n"
+        "- If the request is about a category itself, query product_categories directly; otherwise join via sub_categories/forms and filter product_categories.category_name.\n"
+        "- If a term is unclear (e.g., \"Chain Line\"), look it up in product_categories, then sub_categories, then forms, and use the first match.\n"
+        "- Join tables by ID columns (category_id, sub_category_id, form_id, field_index), not by name.\n"
+        "- For measurement/production questions, start from spc_measurements and join upward: form_fields -> forms -> sub_categories -> product_categories.\n"
+        "- For category measurements, include form_id, form_name, field_index, line_name, inspect_time, value; include sample_index when order matters.\n"
+        "- Exclude sub_categories.sub_category_name = '封存' by default unless the user asks for archived data.\n"
+        "- Use only needed columns; avoid SELECT * unless the user asked for a sample.\n"
             "- For spc_measurements analysis: fetch filtered raw rows first, then aggregate/plot.\n"
             "- If results are empty or too small, run another query (widen filters) instead of guessing.\n"
             "- Multiple small queries are OK. Use find_join_path when unsure.\n"
             "- SQL must be a single SELECT with named params. Do not use LIMIT/max_rows unless the user asks.\n"
             "- For charts: run_sql first, then make_plot. Multiple plots allowed; include legend_label.\n"
-            "- Provide concise summaries plus interpretation/opinion when asked; do not describe JSON schemas.\n"
-            "- Never ask for or reveal secrets.\n"
+        "- Provide concise summaries plus interpretation/opinion when asked; do not describe JSON schemas.\n"
+        "- Never ask for or reveal secrets.\n"
+        f"{language_note}\n"
         )
     else:
         system_instructions = (
@@ -2442,6 +2753,7 @@ def chat(req: ChatRequest) -> ChatResponse:
             "Answer common chat questions directly.\n"
             "If a request needs database data you do not have, say what data you can help with.\n"
             "Avoid guessing or speculation.\n"
+            f"{language_note}\n"
         )
 
 
@@ -2460,7 +2772,7 @@ def chat(req: ChatRequest) -> ChatResponse:
     _workflow_add(workflow, "Received request.")
     query_log: List[Dict[str, Any]] = []
     if not needs_tools:
-        quick = _direct_time_response(req.message)
+        quick = _direct_time_response(req.message, user_lang)
         if quick:
             _trace_event(trace, "assistant", {
                 "content": quick,
@@ -2468,7 +2780,7 @@ def chat(req: ChatRequest) -> ChatResponse:
             })
             _workflow_add(workflow, "Answered directly without database.")
             return ChatResponse(text=quick, trace=trace, plots=[], workflow=workflow, queries=query_log)
-        weather = _direct_weather_response(req.message)
+        weather = _direct_weather_response(req.message, user_lang)
         if weather:
             _trace_event(trace, "assistant", {
                 "content": weather,
@@ -2480,7 +2792,7 @@ def chat(req: ChatRequest) -> ChatResponse:
         assistant_msg = resp.get("message", {}) or {}
         content = assistant_msg.get("content") or ""
         if not content.strip():
-            content = _capabilities_message()
+            content = _capabilities_message(user_lang)
         _trace_event(trace, "assistant", {
             "content": content,
             "tool_calls": [],
@@ -2569,7 +2881,8 @@ def chat(req: ChatRequest) -> ChatResponse:
                 text = _format_tool_fallback(
                     last_tool_name,
                     last_tool_result,
-                    message=req.message,
+                    req.message,
+                    user_lang,
                 )
                 if plot_note:
                     text = f"{text}\n{plot_note}"
@@ -2613,7 +2926,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                             "source": "server",
                         })
                         return _respond(
-                            text=_friendly_tool_error(req.message, str(exc)),
+                            text=_friendly_tool_error(req.message, str(exc), user_lang),
                             plot_png_base64=plot_b64,
                             plot_saved_to=plot_saved_to,
                             query_saved_to=query_saved_to,
@@ -2647,7 +2960,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                             "source": "server",
                         })
                         return _respond(
-                            text=_friendly_tool_error(req.message, str(exc)),
+                            text=_friendly_tool_error(req.message, str(exc), user_lang),
                             plot_png_base64=plot_b64,
                             plot_saved_to=plot_saved_to,
                             query_saved_to=query_saved_to,
@@ -2681,7 +2994,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                             "source": "server",
                         })
                         return _respond(
-                            text=_friendly_tool_error(req.message, str(exc)),
+                            text=_friendly_tool_error(req.message, str(exc), user_lang),
                             plot_png_base64=plot_b64,
                             plot_saved_to=plot_saved_to,
                             query_saved_to=query_saved_to,
@@ -2718,7 +3031,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                             "source": "server",
                         })
                         return _respond(
-                            text=_friendly_tool_error(req.message, str(exc)),
+                            text=_friendly_tool_error(req.message, str(exc), user_lang),
                             plot_png_base64=plot_b64,
                             plot_saved_to=plot_saved_to,
                             query_saved_to=query_saved_to,
@@ -2752,7 +3065,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                             "source": "server",
                         })
                         return _respond(
-                            text=_friendly_tool_error(req.message, str(exc)),
+                            text=_friendly_tool_error(req.message, str(exc), user_lang),
                             plot_png_base64=plot_b64,
                             plot_saved_to=plot_saved_to,
                             query_saved_to=query_saved_to,
@@ -2836,7 +3149,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                     _log_query(query_log, sql_text, sql_params, "assistant_sql", error=str(exc))
                     _workflow_add(workflow, "SQL execution failed.")
                     return _respond(
-                        text=_friendly_tool_error(req.message, str(exc)),
+                        text=_friendly_tool_error(req.message, str(exc), user_lang),
                         plot_png_base64=plot_b64,
                         plot_saved_to=plot_saved_to,
                         query_saved_to=query_saved_to,
@@ -2861,7 +3174,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                 plot_b64, plot_note, plot_saved_to = _maybe_autoplot(
                     req.message, last_tool_name, last_tool_result, plot_b64, plot_saved_to, plot_items
                 )
-                text = _summarize_rows(result, message=req.message)
+                text = _summarize_rows(result, message=req.message, lang=user_lang)
                 if plot_note:
                     text = f"{text}\n{plot_note}"
                 _workflow_add(workflow, "Answer generated from query results.")
@@ -2909,7 +3222,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                     _log_query(query_log, sql_text, None, "assistant_sql", error=str(exc))
                     _workflow_add(workflow, "SQL execution failed.")
                     return _respond(
-                        text=_friendly_tool_error(req.message, str(exc)),
+                        text=_friendly_tool_error(req.message, str(exc), user_lang),
                         plot_png_base64=plot_b64,
                         plot_saved_to=plot_saved_to,
                         query_saved_to=query_saved_to,
@@ -2934,7 +3247,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                 plot_b64, plot_note, plot_saved_to = _maybe_autoplot(
                     req.message, last_tool_name, last_tool_result, plot_b64, plot_saved_to, plot_items
                 )
-                text = _summarize_rows(result, message=req.message)
+                text = _summarize_rows(result, message=req.message, lang=user_lang)
                 if plot_note:
                     text = f"{text}\n{plot_note}"
                 _workflow_add(workflow, "Answer generated from query results.")
@@ -2945,7 +3258,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                     query_saved_to=query_saved_to,
                 )
             if not last_tool_result and _requires_tool_call(req.message):
-                sql, params, error = _auto_query_from_message(req.message)
+                sql, params, error = _auto_query_from_message(req.message, query_log, workflow, user_lang)
                 if sql:
                     try:
                         _trace_event(trace, "tool_call", {
@@ -2963,7 +3276,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                         _log_query(query_log, sql, params, "auto_query", error=str(exc))
                         _workflow_add(workflow, "SQL execution failed.")
                         return _respond(
-                            text=_friendly_tool_error(req.message, str(exc)),
+                            text=_friendly_tool_error(req.message, str(exc), user_lang),
                             plot_png_base64=plot_b64,
                             plot_saved_to=plot_saved_to,
                             query_saved_to=query_saved_to,
@@ -2988,7 +3301,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                     plot_b64, plot_note, plot_saved_to = _maybe_autoplot(
                         req.message, last_tool_name, last_tool_result, plot_b64, plot_saved_to, plot_items
                     )
-                    text = _summarize_rows(result, message=req.message)
+                    text = _summarize_rows(result, message=req.message, lang=user_lang)
                     if plot_note:
                         text = f"{text}\n{plot_note}"
                     _workflow_add(workflow, "Answer generated from query results.")
@@ -3000,7 +3313,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                     )
                 if error:
                     return _respond(
-                        text=_friendly_tool_error(req.message, error),
+                        text=error,
                         plot_png_base64=plot_b64,
                         plot_saved_to=plot_saved_to,
                         query_saved_to=query_saved_to,
@@ -3009,7 +3322,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                 req.message, last_tool_name, last_tool_result, plot_b64, plot_saved_to, plot_items
             )
             if plot_b64 and last_tool_result and last_tool_name == "run_sql":
-                text = _summarize_rows(last_tool_result, message=req.message)
+                text = _summarize_rows(last_tool_result, message=req.message, lang=user_lang)
                 if plot_note:
                     text = f"{text}\n{plot_note}"
                 _workflow_add(workflow, "Answer generated from query results.")
@@ -3026,14 +3339,14 @@ def chat(req: ChatRequest) -> ChatResponse:
             ):
                 _workflow_add(workflow, "Answer generated from query results.")
                 return _respond(
-                    text=_summarize_rows(last_tool_result, message=req.message),
+                    text=_summarize_rows(last_tool_result, message=req.message, lang=user_lang),
                     plot_png_base64=plot_b64,
                     plot_saved_to=plot_saved_to,
                     query_saved_to=query_saved_to,
                 )
             if not last_tool_result and _requires_tool_call(req.message):
                 return _respond(
-                    text=_needs_db_data_message(),
+                    text=_needs_db_data_message(user_lang),
                     plot_png_base64=plot_b64,
                     plot_saved_to=plot_saved_to,
                     query_saved_to=query_saved_to,
@@ -3305,7 +3618,8 @@ def chat(req: ChatRequest) -> ChatResponse:
         text = _format_tool_fallback(
             last_tool_name,
             last_tool_result,
-            message=req.message,
+            req.message,
+            user_lang,
         )
         if plot_note:
             text = f"{text}\n{plot_note}"
@@ -3318,20 +3632,20 @@ def chat(req: ChatRequest) -> ChatResponse:
         )
     if last_tool_error:
         return _respond(
-            text=_friendly_tool_error(req.message, last_tool_error),
+            text=_friendly_tool_error(req.message, last_tool_error, user_lang),
             plot_png_base64=plot_b64,
             plot_saved_to=plot_saved_to,
             query_saved_to=query_saved_to,
         )
     if not last_tool_result and _requires_tool_call(req.message):
         return _respond(
-            text=_needs_db_data_message(),
+            text=_needs_db_data_message(user_lang),
             plot_png_base64=plot_b64,
             plot_saved_to=plot_saved_to,
             query_saved_to=query_saved_to,
         )
     return _respond(
-        text="I couldn't finish the request within the tool loop limit. Try narrowing the question.",
+        text=_t(user_lang, "tool_loop_limit"),
         plot_png_base64=plot_b64,
         plot_saved_to=plot_saved_to,
         query_saved_to=query_saved_to,
